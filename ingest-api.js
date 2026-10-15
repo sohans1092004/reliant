@@ -9,6 +9,9 @@ import { pathToFileURL } from 'node:url';
 import { pool, newProducer, publishEvent, ensureTopics } from './lib/infra.js';
 import { sendJson, readJson, bearer, safeEqual } from './lib/http.js';
 import { takeToken } from './lib/rate-limit.js';
+import { log } from './lib/log.js';
+import { metrics, serveMetrics } from './lib/metrics.js';
+import { initTracing, inSpan, currentTraceparent, SpanKind } from './lib/tracing.js';
 import { validateEvent } from './core/event.js';
 
 const PORT = Number(process.env.INGEST_PORT || 3000);
@@ -54,11 +57,11 @@ async function ingest(req, res) {
   // First durability boundary. The PK makes a re-submitted event_id a no-op, and the
   // tenants FK rejects unknown tenants in the same round trip (no separate lookup).
   const { rows: inserted } = await pool.query(
-    `INSERT INTO events (event_id, tenant_id, type, payload, created_at)
-     VALUES ($1, $2, $3, $4, NOW())
+    `INSERT INTO events (event_id, tenant_id, type, payload, created_at, traceparent)
+     VALUES ($1, $2, $3, $4, NOW(), $5)
      ON CONFLICT (event_id) DO NOTHING
      RETURNING event_id, tenant_id, type, payload, created_at, published_to_kafka`,
-    [eventId, body.tenant_id, body.type, body.payload],
+    [eventId, body.tenant_id, body.type, body.payload, currentTraceparent()],
   ).catch((err) => {
     if (err.code === '23503') throw Object.assign(new Error(`unknown tenant ${body.tenant_id}`), { status: 400 });
     throw err;
@@ -81,7 +84,7 @@ async function ingest(req, res) {
     await publishEvent(producer, event); // second durability boundary
   } catch (err) {
     // Saved but not published: retry-publisher will pick it up, and a client retry is safe.
-    console.error('Kafka publish failed:', eventId, err.message);
+    log.error('kafka publish failed, retry-publisher will finish it', { event_id: eventId, tenant_id: body.tenant_id, err });
     return sendJson(res, 503, { error: 'accepted into storage but not yet queued; retry is safe', event_id: eventId });
   }
   return sendJson(res, inserted[0] ? 202 : 200, { event_id: eventId, duplicate: !inserted[0] });
@@ -89,11 +92,18 @@ async function ingest(req, res) {
 
 export const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === 'POST' && req.url === '/events') return await ingest(req, res);
+    if (req.method === 'POST' && req.url === '/events') {
+      const done = metrics.ingestDuration.startTimer();
+      res.on('finish', () => { done(); metrics.ingestRequests.inc({ status: String(res.statusCode) }); });
+      return await inSpan('ingest', { kind: SpanKind.SERVER, attributes: { 'http.route': '/events' } }, async (span) => {
+        await ingest(req, res);
+        span.setAttribute('http.response.status_code', res.statusCode); // set by sendJson; span still open here
+      });
+    }
     if (req.method === 'GET' && req.url === '/health') return sendJson(res, 200, { ok: true });
     sendJson(res, 404, { error: 'not found' });
   } catch (err) {
-    if (!err.status) console.error('Ingest error:', err);
+    if (!err.status) log.error('ingest error', { err, stack: err.stack });
     sendJson(res, err.status || 500, { error: err.status ? err.message : 'internal error' });
   }
 });
@@ -101,5 +111,7 @@ export const server = http.createServer(async (req, res) => {
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   await ensureTopics();
   await producer.connect();
-  server.listen(PORT, () => console.log(`Ingest API listening on http://localhost:${PORT}`));
+  initTracing('ingest');
+  serveMetrics(9100);
+  server.listen(PORT, () => log.info('ingest API listening', { port: PORT }));
 }

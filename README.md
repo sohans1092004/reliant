@@ -31,6 +31,14 @@ npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for
 
 Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
 
+## Observability
+
+- **Metrics:** each process serves Prometheus metrics on an internal port (never the public dashboard port): ingest `:9100`, consumer `:9101`, worker `:9102`, dashboard `:9103`, retry-publisher `:9104`. Override with `METRICS_PORT`, or set `0` to disable, e.g. for a second worker on the same host. Definitions are in `lib/metrics.js`; the worker also reports system-wide DLQ depth, pending backlog and open breakers.
+- **Logs:** one JSON object per line (`lib/log.js`), carrying `event_id` / `endpoint_id` / `tenant_id` wherever they're known.
+- **Traces (OpenTelemetry):** set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` and each event gets one trace across processes: `ingest` → `kafka.publish` → `webhook.post` (consumer) → `deliver.retry` / `webhook.post` / `ledger.write` (worker, even hours later). The context travels in Kafka headers and in `events.traceparent`. With the variable unset, tracing is off and costs nothing.
+- **Stack:** `docker compose --profile observability up -d` starts Prometheus (http://localhost:9090, alert rules in `observability/alerts.yml`), Jaeger (http://localhost:16686) and Grafana (http://localhost:3002, with the provisioned *Reliant overview* dashboard and Jaeger in Explore). The profile is opt-in, so plain `docker compose up` and CI are unaffected.
+- **Alerts:** DLQ depth and growth, consumer lag growing, p95 latency above 5s, retry queue stuck, a breaker open for more than 30 minutes (per endpoint), per-tenant success rate, and a process down.
+
 **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request. Core unit tests run first, as a fast gate. If they pass, the integration tests run against the same `docker-compose.yml` stack, with test-only secrets generated fresh for each run. Load tests are not part of CI.
 
 ## Layout

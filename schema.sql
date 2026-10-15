@@ -41,6 +41,9 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- W3C trace context of the ingest request, so retries hours later join the same trace.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS traceparent TEXT;
+
 -- Where a tenant's events currently go. One tenant can have many endpoints.
 CREATE TABLE IF NOT EXISTS endpoints (
   endpoint_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

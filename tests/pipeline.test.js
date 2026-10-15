@@ -14,11 +14,14 @@ import { sha256 } from '../lib/http.js';
 import { verify } from '../core/signing.js';
 
 const INGEST = 'http://localhost:3100';
+// Off the defaults (9100-9102) so the test can't collide with locally running services.
+const METRICS_PORTS = { 'ingest-api.js': 9190, 'consumer.js': 9191, 'delivery-worker.js': 9192 };
 const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
+const stdout = {};       // file -> everything the child printed
 const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true };
 const children = [];
 let receiver, dashboardBase;
@@ -96,9 +99,10 @@ before(async () => {
   }
 
   const env = { ...process.env, RETRY_FAST_MODE: 'true', RETRY_SCHEDULE_MINUTES: '1,1', WORKER_POLL_MS: '300', INGEST_PORT: '3100', ALLOW_PRIVATE_ENDPOINTS: 'true' };
-  for (const file of ['ingest-api.js', 'consumer.js', 'delivery-worker.js']) {
-    const child = spawn(process.execPath, [file], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    if (process.env.VERBOSE) child.stdout.on('data', (d) => process.stdout.write(`[${file}] ${d}`));
+  for (const [file, metricsPort] of Object.entries(METRICS_PORTS)) {
+    const child = spawn(process.execPath, [file], { env: { ...env, METRICS_PORT: String(metricsPort) }, stdio: ['ignore', 'pipe', 'pipe'] });
+    stdout[file] = '';
+    child.stdout.on('data', (d) => { stdout[file] += d; if (process.env.VERBOSE) process.stdout.write(`[${file}] ${d}`); });
     child.stderr.on('data', (d) => process.stderr.write(`[${file}] ${d}`));
     children.push(child);
   }
@@ -237,4 +241,51 @@ test("a tenant's own retry schedule replaces the global one", async () => {
   const { event_id } = (await ingest('pipe_custom')).body;
   const dead = await waitFor(async () => (await dash('pipe_custom', 'GET', '/api/dlq')).body.find((d) => d.event_id === event_id), 'dead letter');
   assert.deepEqual([dead.dead_reason, dead.attempt_count], ['delivery_exhausted', 2]); // inline + 1 retry
+});
+
+test('metrics: each process exposes what the tests above did', async () => {
+  const scrape = async (file) => (await fetch(`http://localhost:${METRICS_PORTS[file]}/metrics`)).text();
+  // A series with no labels, e.g. value(text, 'reliant_open_circuit_breakers').
+  const value = (text, series) => {
+    const line = text.split('\n').find((l) => l.startsWith(series + ' '));
+    return line ? Number(line.split(' ').pop()) : undefined;
+  };
+  // Sum of every series line starting with `prefix` (so a prefix can match several label sets).
+  const sum = (text, prefix) => text.split('\n').filter((l) => l.startsWith(prefix)).reduce((a, l) => a + Number(l.split(' ').pop()), 0);
+
+  const ingest = await scrape('ingest-api.js');
+  assert.ok(sum(ingest, 'reliant_ingest_requests_total{status="202"}') > 0, 'accepted events counted');
+  assert.ok(sum(ingest, 'reliant_ingest_requests_total{status="401"}') >= 1, 'rejected token counted');
+
+  const consumer = await scrape('consumer.js');
+  assert.ok(sum(consumer, 'reliant_delivery_attempts_total{source="inline",outcome="delivered"') > 0);
+  assert.ok(sum(consumer, 'reliant_delivery_attempts_total{source="inline",outcome="failed"') > 0);
+  assert.ok(value(consumer, 'reliant_delivery_latency_seconds_count') > 0);
+  assert.ok(sum(consumer, 'reliant_poison_messages_total') >= 1, 'the poison pill test');
+  assert.match(consumer, /reliant_consumer_lag\{partition="\d+"\} \d+/);
+  assert.match(consumer, /nodejs_eventloop_lag_seconds/, 'default process metrics');
+
+  const worker = await scrape('delivery-worker.js');
+  assert.ok(sum(worker, 'reliant_dead_letters_total{reason="delivery_exhausted"}') >= 1);
+  assert.ok(sum(worker, 'reliant_dead_letters_total{reason="payload_rejected"}') >= 1);
+  assert.ok(sum(worker, 'reliant_endpoint_pings_total{result="healthy"}') >= 1);
+  assert.ok(sum(worker, 'reliant_circuit_breaker_transitions_total{from="closed",to="open"}') >= 1);
+  assert.ok(sum(worker, 'reliant_dlq_depth{reason="delivery_exhausted"}') >= 1, 'gauge read from Postgres');
+  assert.match(worker, new RegExp(`reliant_circuit_breaker_open\{endpoint_id="${endpoints.pipe_down}",tenant="pipe_down"\} 1`), 'per-endpoint gauge from Redis');
+  assert.ok(value(worker, 'reliant_oldest_pending_seconds') >= 0);
+  assert.match(worker, /reliant_pending_deliveries \d+/);
+});
+
+test('logs: every line is JSON; failures and dead letters carry event, endpoint and tenant ids', () => {
+  for (const [file, text] of Object.entries(stdout)) {
+    for (const line of text.split('\n').filter(Boolean)) {
+      // kafkajs's own log lines are JSON too; anything else means a stray console.log.
+      assert.doesNotThrow(() => JSON.parse(line), `${file} printed a non-JSON line: ${line.slice(0, 120)}`);
+    }
+  }
+  const consumerLines = stdout['consumer.js'].split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(consumerLines.some((l) => l.service === 'consumer' && l.msg === 'chunk processed'), 'structured consumer logs present');
+  const workerLines = stdout['delivery-worker.js'].split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(workerLines.some((l) => l.msg === 'dead-lettered' && l.event_id && l.endpoint_id && l.tenant_id), 'dead letters carry their ids');
+  assert.ok(consumerLines.some((l) => l.msg === 'inline attempt failed, queued for retry' && l.event_id && l.endpoint_id), 'failed attempts carry their ids');
 });

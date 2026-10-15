@@ -4,6 +4,12 @@ import { getBreakers, applyOutcomes } from "./lib/breaker.js";
 import * as cb from "./core/circuit-breaker.js";
 import { nextRetryDelay } from "./core/backoff.js";
 import { validateEvent } from "./core/event.js";
+import { log } from "./lib/log.js";
+import { metrics, serveMetrics } from "./lib/metrics.js";
+import { initTracing, fromTraceparent } from "./lib/tracing.js";
+import { context, trace } from "@opentelemetry/api";
+
+const outcomeLabel = (r) => (r.ok ? "delivered" : r.timedOut ? "timeout" : "failed");
 
 // Kept short because Kafka fetches a partition's next batch only after this one is done:
 // the first timeout against a newly broken endpoint holds up every tenant on the
@@ -30,7 +36,12 @@ async function sendToDlq(poisoned, partition) {
       }),
     })),
   });
-  for (const p of poisoned) console.log(`Unprocessable message at partition ${partition} offset ${p.message.offset} sent to DLQ:`, p.errors.join("; "));
+  metrics.poisonMessages.inc(poisoned.length);
+  for (const p of poisoned) {
+    log.warn("unprocessable message sent to DLQ topic", {
+      partition, offset: p.message.offset, event_id: p.event?.event_id, tenant_id: p.event?.tenant_id, errors: p.errors,
+    });
+  }
 }
 
 // One chunk of a partition's messages, in Kafka order. The bookkeeping is done per
@@ -53,7 +64,9 @@ async function processChunk(messages, partition, heartbeat) {
   );
   const archive = new Map(archived.map((r) => [r.event_id, r.tenant_id]));
   const valid = [];
+  const traceCtx = new Map(); // event_id -> the ingest request's trace context (Kafka header)
   for (const e of events) {
+    traceCtx.set(e.event.event_id, fromTraceparent(e.message.headers?.traceparent?.toString()));
     if (archive.get(e.event.event_id) === e.event.tenant_id) valid.push(e.event);
     else poisoned.push({ ...e, errors: ["event not found in the archive for this tenant"] });
   }
@@ -100,7 +113,11 @@ async function processChunk(messages, partition, heartbeat) {
         continue;
       }
       const started = Date.now();
-      const result = await sendSigned(event, endpoint, INLINE_TIMEOUT_MS);
+      metrics.deliveryLatency.observe((started - Date.parse(event.created_at)) / 1000);
+      // The attempt's span becomes part of this event's trace, not the chunk's.
+      const result = await context.with(traceCtx.get(event.event_id), () => sendSigned(event, endpoint, INLINE_TIMEOUT_MS));
+      metrics.attempts.inc({ source: "inline", outcome: outcomeLabel(result), tenant: event.tenant_id });
+      metrics.attemptDuration.observe({ source: "inline" }, (Date.now() - started) / 1000);
       ledger.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, tenant_id: event.tenant_id,
         attempt_number: 1, ...result, latencyMs: Date.now() - started });
       if (!outcomes.has(endpoint.endpoint_id)) outcomes.set(endpoint.endpoint_id, []);
@@ -112,7 +129,10 @@ async function processChunk(messages, partition, heartbeat) {
         // other failure is a real one and backs off per the retry policy.
         queue.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, attempt_count: 1,
           delay_ms: result.timedOut ? 0 : nextRetryDelay(1, retryPolicyFor(endpoint.retry_schedule_minutes)), error: result.error, http_status: result.httpStatus });
-        console.log("Inline attempt failed/timed out, queued for retry:", endpoint.url, "-", result.error);
+        log.info("inline attempt failed, queued for retry", {
+          event_id: event.event_id, endpoint_id: endpoint.endpoint_id, tenant_id: event.tenant_id,
+          error: result.error, http_status: result.httpStatus, retry_now: !!result.timedOut,
+        });
       }
     }
   }));
@@ -120,7 +140,11 @@ async function processChunk(messages, partition, heartbeat) {
   // 6. Record everything before the offset is committed (ADR-005). Queue rows go in one
   //    statement; ids are assigned in array order, which is what keeps per-endpoint
   //    order for rows sharing a created_at. ON CONFLICT: a redelivered chunk is a no-op.
-  await recordAttempts(ledger);
+  const links = [...new Set(ledger.map((l) => l.event_id))]
+    .map((id) => trace.getSpanContext(traceCtx.get(id)))
+    .filter((sc) => sc && trace.isSpanContextValid(sc))
+    .map((sc) => ({ context: sc }));
+  await recordAttempts(ledger, links);
   if (queue.length) {
     const col = (f) => queue.map(f);
     await pool.query(
@@ -137,11 +161,13 @@ async function processChunk(messages, partition, heartbeat) {
   // Atomic per endpoint (compare-and-set), so outcomes reported at the same moment by
   // workers or other consumers aren't lost.
   await Promise.all([...outcomes].map(([id, list]) => applyOutcomes(id, list)))
-    .catch((err) => console.error("Breaker update failed:", err.message));
-  console.log(`Partition ${partition}: ${valid.length} events, ${ledger.filter((l) => l.ok).length} delivered inline, ${queue.length} queued`);
+    .catch((err) => log.error("breaker update failed", { err }));
+  log.info("chunk processed", { partition, events: valid.length, delivered_inline: ledger.filter((l) => l.ok).length, queued: queue.length });
 }
 
 async function run() {
+  initTracing("consumer");
+  serveMetrics(9101);
   await ensureTopics();
   await dlqProducer.connect();
   await consumer.connect();
@@ -162,6 +188,8 @@ async function run() {
         await commitOffsetsIfNecessary();
         await heartbeat();
       }
+      // offsetLag() = messages after this batch's last one: after processing, the real lag.
+      metrics.consumerLag.set({ partition: String(batch.partition) }, Number(batch.offsetLag()));
     },
   });
 }
@@ -173,7 +201,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
     if (stopping) return;
     stopping = true;
-    console.log("Shutting down consumer...");
+    log.info("shutting down");
     await consumer.disconnect();
     await dlqProducer.disconnect();
     await closeRedis();
@@ -183,6 +211,6 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 }
 
 run().catch((err) => {
-  console.error("Consumer failed to start:", err);
+  log.error("consumer failed to start", { err });
   process.exit(1);
 });

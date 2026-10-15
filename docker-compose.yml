@@ -20,7 +20,7 @@ services:
 
   # Kafka-compatible message queue (Redpanda), single container, no Zookeeper needed.
   reliant_kafka:
-    image: redpandadata/redpanda:latest
+    image: redpandadata/redpanda:v26.2.2 # pinned: what `latest` was when CI was set up
     command:
       - redpanda start
       - --smp 1
@@ -31,3 +31,43 @@ services:
       - --advertise-kafka-addr PLAINTEXT://localhost:9092
     ports:
       - "9092:9092"
+
+  # Opt-in: docker compose --profile observability up -d  ->  http://localhost:9090
+  # Scrapes the Reliant processes on the host; alert rules in observability/alerts.yml.
+  reliant_prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: [observability]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./observability:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Linux; Docker Desktop provides it already
+
+  # Opt-in tracing backend: services send OTLP to :4318 when OTEL_EXPORTER_OTLP_ENDPOINT
+  # is set; traces are browsable at http://localhost:16686 (and from Grafana).
+  reliant_jaeger:
+    image: jaegertracing/all-in-one:1.57.0
+    profiles: [observability]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP over HTTP
+
+  # Opt-in dashboards: http://localhost:3002 (anonymous admin - local dev only).
+  # Prometheus + Jaeger datasources and the "Reliant overview" dashboard are provisioned.
+  reliant_grafana:
+    image: grafana/grafana:11.1.0
+    profiles: [observability]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3002:3000"
+    depends_on: [reliant_prometheus, reliant_jaeger]

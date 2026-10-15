@@ -1,0 +1,70 @@
+# Alerts from spec §12, plus the NFRs they protect. Thresholds are starting points:
+# tune them once there's real traffic to compare against.
+groups:
+  - name: reliant
+    rules:
+      - alert: ReliantProcessDown
+        expr: up{job="reliant"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.process }} is not answering metrics scrapes"
+
+      - alert: ReliantDLQDepthHigh
+        expr: sum(reliant_dlq_depth) > 1000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} deliveries are dead-lettered"
+          description: "Check reliant_dlq_depth by reason: delivery_exhausted = customer endpoints down, payload_rejected = receivers rejecting events, processing_error = our bug."
+
+      - alert: ReliantDLQGrowingFast
+        expr: sum(increase(reliant_dead_letters_total[15m])) > 100
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} deliveries dead-lettered in the last 15 minutes"
+
+      - alert: ReliantConsumerLagGrowing
+        # Backlog is large AND still rising: the consumer isn't keeping up.
+        expr: sum(reliant_consumer_lag) > 10000 and deriv(sum(reliant_consumer_lag)[10m:1m]) > 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Kafka consumer lag is {{ $value }} and growing"
+          description: "Add consumer processes (up to the partition count) or check consumer CPU (process_cpu_seconds_total)."
+
+      - alert: ReliantDeliveryLatencyHigh
+        # NFR: accepted -> first delivery attempt p95 < 5s.
+        expr: histogram_quantile(0.95, sum by (le) (rate(reliant_delivery_latency_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 delivery latency is {{ $value }}s (target < 5s)"
+
+      - alert: ReliantTenantSuccessRateLow
+        expr: |
+          sum by (tenant) (rate(reliant_delivery_attempts_total{outcome="delivered"}[15m]))
+            / sum by (tenant) (rate(reliant_delivery_attempts_total[15m])) < 0.5
+          and sum by (tenant) (rate(reliant_delivery_attempts_total[15m])) > 0.1
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "Under half of {{ $labels.tenant }}'s delivery attempts succeed"
+          description: "Usually the tenant's endpoint, not Reliant. Worth a heads-up to the tenant."
+
+      - alert: ReliantCircuitBreakerOpenLong
+        # Per endpoint: the series exists only while that endpoint's breaker is open.
+        expr: reliant_circuit_breaker_open == 1
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint_id }} (tenant {{ $labels.tenant }}) has had its circuit open for over 30 minutes"
+
+      - alert: ReliantRetryQueueStuck
+        # The default retry schedule spans ~14.6h; anything pending much longer is stuck.
+        expr: reliant_oldest_pending_seconds > 16 * 3600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Oldest pending delivery is {{ $value | humanizeDuration }} old"
+          description: "Check that delivery-worker is running and claiming rows (reliant_retry_attempt_number rate)."

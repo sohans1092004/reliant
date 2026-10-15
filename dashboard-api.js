@@ -23,6 +23,8 @@ import { pool, encryptSecret, retryPolicy } from './lib/infra.js';
 import { getBreaker } from './lib/breaker.js';
 import { assertSafeUrl } from './lib/deliver.js';
 import { sendJson, readJson, bearer, sha256 } from './lib/http.js';
+import { log } from './lib/log.js';
+import { serveMetrics } from './lib/metrics.js';
 import { generateSecret } from './core/signing.js';
 import { validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './core/backoff.js';
 
@@ -237,11 +239,12 @@ export const server = http.createServer(async (req, res) => {
     }
     sendJson(res, 404, { error: 'not found' });
   } catch (err) {
-    if (!err.status) console.error('Dashboard error:', err);
+    if (!err.status) log.error('dashboard error', { err, stack: err.stack });
     sendJson(res, err.status || 500, { error: err.status ? err.message : 'internal error' });
   }
 });
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  server.listen(PORT, () => console.log(`Dashboard on http://localhost:${PORT}`));
+  serveMetrics(9103);
+  server.listen(PORT, () => log.info('dashboard listening', { port: PORT }));
 }
