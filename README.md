@@ -31,6 +31,8 @@ npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for
 
 Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
 
+**CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request. Core unit tests run first, as a fast gate. If they pass, the integration tests run against the same `docker-compose.yml` stack, with test-only secrets generated fresh for each run. Load tests are not part of CI.
+
 ## Layout
 
 | Path | What |
