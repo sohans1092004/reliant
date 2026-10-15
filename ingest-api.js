@@ -37,19 +37,21 @@ async function ingest(req, res) {
   const problems = validateEvent(body);
   if (problems.length) return sendJson(res, 400, { error: 'invalid event', problems });
 
-  const { rows: tenant } = await pool.query('SELECT 1 FROM tenants WHERE tenant_id = $1', [body.tenant_id]);
-  if (!tenant.length) return sendJson(res, 400, { error: `unknown tenant ${body.tenant_id}` });
   if (await overRateLimit(body.tenant_id)) return sendJson(res, 429, { error: 'rate limit exceeded' });
 
   const eventId = body.event_id || crypto.randomUUID();
-  // First durability boundary. The PK makes a re-submitted event_id a no-op.
+  // First durability boundary. The PK makes a re-submitted event_id a no-op, and the
+  // tenants FK rejects unknown tenants in the same round trip (no separate lookup).
   const { rows: inserted } = await pool.query(
     `INSERT INTO events (event_id, tenant_id, type, payload, created_at)
      VALUES ($1, $2, $3, $4, NOW())
      ON CONFLICT (event_id) DO NOTHING
      RETURNING event_id, tenant_id, type, payload, created_at, published_to_kafka`,
     [eventId, body.tenant_id, body.type, body.payload],
-  );
+  ).catch((err) => {
+    if (err.code === '23503') throw Object.assign(new Error(`unknown tenant ${body.tenant_id}`), { status: 400 });
+    throw err;
+  });
 
   let event = inserted[0];
   if (!event) {

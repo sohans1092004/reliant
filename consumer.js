@@ -75,28 +75,34 @@ async function run() {
       } catch {
         event = null;
       }
-      const problems = validateEvent(event);
-      if (problems.length > 0) {
-        // Poison pill: can never be processed, retrying would only crash-loop.
-        // Park it on the DLQ topic and move on. (There's no events row to point at.)
+      // Poison pill: can never be processed, retrying would only crash-loop the
+      // partition. Park it on the DLQ topic and move on (there may be no events row
+      // to point a dead_letters entry at).
+      const poison = async (errors) => {
         await dlqProducer.send({
           topic: TOPICS.dlq,
           messages: [{ key: event?.tenant_id ?? null, value: JSON.stringify({
-            reason: "processing_error", errors: problems, partition, offset: message.offset,
+            reason: "processing_error", errors, partition, offset: message.offset,
             raw: message.value.toString().slice(0, 10_000),
           }) }],
         });
-        console.log(`Malformed message at partition ${partition} offset ${message.offset} sent to DLQ:`, problems.join("; "));
-        return;
-      }
+        console.log(`Unprocessable message at partition ${partition} offset ${message.offset} sent to DLQ:`, errors.join("; "));
+      };
+
+      const problems = validateEvent(event);
+      if (problems.length > 0) return poison(problems);
       console.log("Received event:", event.event_id, "for", event.tenant_id);
 
-      // Look up this tenant's registered endpoint(s) instead of using a fixed URL.
+      // This tenant's active endpoints, plus (same round trip) whether the event is
+      // really in the archive for this tenant. A Kafka message without its archive row
+      // would otherwise fail the ledger's foreign key and stall the partition forever.
       const { rows } = await pool.query(
-        `SELECT endpoint_id, url, secret_encrypted, secret_previous_encrypted, secret_rotated_at
+        `SELECT EXISTS (SELECT 1 FROM events WHERE event_id = $2 AND tenant_id = $1) AS archived,
+                endpoint_id, url, secret_encrypted, secret_previous_encrypted, secret_rotated_at
          FROM endpoints WHERE tenant_id = $1 AND is_active = TRUE`,
-        [event.tenant_id],
+        [event.tenant_id, event.event_id],
       );
+      if (rows.length > 0 && !rows[0].archived) return poison(["event not found in the archive for this tenant"]);
 
       // Different endpoints have no ordering relationship to each other, so one
       // slow endpoint's 3s timeout doesn't delay its tenant-mates on the same event.

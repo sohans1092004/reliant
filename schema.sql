@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS events (
   tenant_id          TEXT NOT NULL
 );
 
+-- Unknown tenants are rejected by Postgres inside the ingest INSERT itself.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'events_tenant_fk') THEN
+    ALTER TABLE events ADD CONSTRAINT events_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id);
+  END IF;
+END $$;
+
 -- Where a tenant's events currently go. One tenant can have many endpoints.
 CREATE TABLE IF NOT EXISTS endpoints (
   endpoint_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
