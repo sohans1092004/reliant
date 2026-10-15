@@ -14,12 +14,12 @@ import { sha256 } from '../lib/http.js';
 import { verify } from '../core/signing.js';
 
 const INGEST = 'http://localhost:3100';
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
-const behaviour = { flakyFailuresLeft: 2, downIsDown: true };
+const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1 };
 const children = [];
 let receiver, dashboardBase;
 
@@ -79,6 +79,7 @@ before(async () => {
     if (path === '/down' && behaviour.downIsDown) status = 500;
     const event = JSON.parse(body);
     if (path === '/picky' && event.payload.bad) status = 422; // rejects one kind of event, accepts the rest
+    if (path === '/burst' && behaviour.burstFailuresLeft > 0) { behaviour.burstFailuresLeft--; status = 503; }
     received.push({ path, eventId: event.event_id, type: event.type, verified, status });
     res.writeHead(status); res.end();
   });
@@ -86,7 +87,7 @@ before(async () => {
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -212,4 +213,12 @@ test('event the endpoint keeps rejecting is set aside after a healthy ping; next
 
   const dlq = await dash('pipe_picky', 'GET', '/api/dlq');
   assert.equal(dlq.body.find((d) => d.event_id === bad)?.dead_reason, 'payload_rejected');
+});
+
+test('a burst queued behind a failure in one batch is delivered in exactly the order it was accepted', async () => {
+  const ids = [];
+  for (let i = 0; i < 6; i++) ids.push((await ingest('pipe_burst', { payload: { i } })).body.event_id); // sequential: accepted in this order
+  await waitFor(() => ids.every((id) => okFor('/burst', id).length), 'whole burst delivered');
+  const order = received.filter((r) => r.path === '/burst' && r.status === 200).map((r) => r.eventId);
+  assert.deepEqual(order, ids);
 });
