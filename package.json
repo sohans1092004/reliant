@@ -11,7 +11,8 @@
     "worker": "node delivery-worker.js",
     "retry-publisher": "node retry-publisher.js",
     "dashboard": "node dashboard-api.js",
-    "loadtest": "node loadtest/run.js"
+    "loadtest": "node loadtest/run.js",
+    "retention": "node retention.js"
   },
   "keywords": [],
   "author": "",

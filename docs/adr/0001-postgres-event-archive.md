@@ -22,7 +22,7 @@ If step 2 fails, the API returns 503. The event is already safe and `retry-publi
 - Replay works for any event still in Postgres, however old, regardless of Kafka retention.
 - Every event costs one Postgres insert on the hot ingest path. Postgres insert rate becomes the ingest ceiling before Kafka does (to be measured in the load tests).
 - An event can exist in Postgres but not yet in Kafka. That window is real, and `retry-publisher.js` exists to close it. It skips events younger than 30 seconds so it doesn't race an in-flight ingest request.
-- **Nothing ever deletes from `events`.** The 30-day requirement is met trivially, but storage grows forever. A retention job (archive older rows to S3, then delete) is needed before this sees real traffic.
+- **Retention:** `retention.js` (`npm run retention -- --apply`) archives events older than `RETENTION_DAYS` (default 35, refuses < 30) together with their ledger and finished delivery rows to gzip JSON-lines files, then deletes them. Events with a pending delivery are never touched. Local files stand in for S3. Kafka messages whose archive row is gone are sent to the DLQ topic by the consumer instead of stalling it.
 
 ## Alternatives considered
 
