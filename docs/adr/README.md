@@ -1,0 +1,15 @@
+# Architecture Decision Records
+
+One file per decision: what was decided, why, and what it costs. Numbers follow the spec (§16 and v2 §6), so an ADR keeps its number even when the decision differs from what the spec proposed.
+
+| ADR | Decision | Status |
+|---|---|---|
+| [001](0001-postgres-event-archive.md) | Postgres is the durable event archive, independent of Kafka retention | Accepted |
+| [002](0002-retry-queue-in-postgres.md) | Retries live in a Postgres queue, not Kafka retry topics (**reverses the spec**) | Accepted |
+| 003 | Self-hosted Kafka on EKS vs managed MSK | Not decided: no cloud deployment yet |
+| [004](0004-kafka-for-primary-queue.md) | Kafka (not RabbitMQ) for the primary delivery queue | Accepted |
+| [005](0005-commit-offset-after-ledger-write.md) | Commit the Kafka offset only after the ledger write | Accepted |
+| 006 | Fixed worker pool vs HPA autoscaling | Not decided: no Kubernetes yet |
+| [007](0007-endpoint-isolation.md) | Endpoint isolation: bounded inline attempt + hand-off to a separate retry queue | Accepted |
+| [008](0008-ordering-guarantee.md) | Ordering: completion-order per endpoint, with a ping to set aside an event a healthy endpoint keeps rejecting | Accepted |
+

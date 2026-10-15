@@ -41,9 +41,23 @@ npm run test:integration      # needs docker compose up and no consumer/worker r
 | `dashboard-api.js` + `public/` | Tenant API + UI |
 | `schema.sql` | Idempotent schema, also applied by `npm run migrate` |
 
-## Where this deviates from the spec (decide and write up as ADRs)
+## Receiver contract
 
-- **Retries use a Postgres queue (`delivery_attempts`), not Kafka retry topics.** ADR-002 picked retry topics. The Postgres queue came out of the Day 2 slow-endpoint work: it separates delivery concurrency from Kafka partitions and gives strict per-endpoint ordering via `DISTINCT ON`. The cost is polling load on Postgres.
+Every request is a signed `POST` with `webhook-id` (= `event_id`), `webhook-timestamp` and `webhook-signature` (`v1,<base64 HMAC-SHA256 of id.timestamp.body>`; two signatures, space-separated, during a secret rotation). See `verify()` in `core/signing.js`. Receivers should:
+
+- return 2xx only once the event is handled; anything else is retried
+- deduplicate on `webhook-id`, because delivery is at-least-once
+- answer `type: "reliant.ping"` with 2xx and do nothing else; Reliant uses it to tell a broken endpoint from one bad event
+
+## Where this deviates from the spec
+
+Decisions and their trade-offs are in [`docs/adr/`](docs/adr/README.md). The two that differ from the spec:
+
+- **[ADR-002](docs/adr/0002-retry-queue-in-postgres.md):** retries use a Postgres queue (`delivery_attempts`), not Kafka retry topics.
+- **[ADR-008](docs/adr/0008-ordering-guarantee.md):** delivery is completion-ordered per endpoint, not initiation-ordered. If an event fails 3 times, the endpoint is pinged. If the ping succeeds, the event is the problem: it's dead-lettered as `payload_rejected` (replayable) so it stops blocking the queue.
+
+Smaller deviations:
+
 - **A clean inline success writes only a ledger row, not a `delivery_attempts` row.** The status API falls back to the ledger.
 - **Ingest dedups on the `events.event_id` primary key only.** There's no Redis fast path in front of it, since the PK index check is already cheap.
 - **Not built (needs AWS / real infra):** Kubernetes, Terraform, CI/CD, load tests (§14), OpenTelemetry/metrics, ledger time-partitioning, per-tenant retry policies.
