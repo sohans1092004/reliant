@@ -55,6 +55,17 @@
       <table hidden id="historyTable"><thead><tr><th>When</th><th>Event</th><th>Type</th><th>#</th><th>Result</th><th>Latency</th><th></th></tr></thead><tbody id="history"></tbody></table>
     </section>
 
+    <h2>Retry policy</h2>
+    <section>
+      <form id="settings" class="row">
+        <label for="schedule">Minutes between retries</label>
+        <input id="schedule" class="grow" placeholder="e.g. 1, 5, 30" aria-describedby="scheduleHint">
+        <button>Save</button>
+        <button type="button" id="resetSchedule">Use default</button>
+      </form>
+      <p id="scheduleHint" class="muted"></p>
+    </section>
+
     <h2>Dead letters</h2>
     <section>
       <p id="dlqEmpty" class="muted">Nothing here.</p>
@@ -99,6 +110,12 @@ async function loadEndpoints() {
     const actions = el('div', null, 'row');
     actions.append(
       btn('History', () => loadHistory(ep)),
+      btn('Replay dead letters', () => run(async () => {
+        if (!confirm(`Re-deliver every dead-lettered event for ${ep.url}, in their original order?`)) return;
+        const r = await api('POST', `/api/endpoints/${ep.endpoint_id}/replay-dead`, {});
+        say(`${r.requeued} dead letter(s) re-queued for this endpoint.`, 'ok');
+        await loadDlq();
+      })),
       btn(ep.is_active ? 'Disable' : 'Enable', () => run(async () => { await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { is_active: !ep.is_active }); await loadEndpoints(); })),
       btn('Rotate secret', () => run(async () => {
         if (!confirm('Rotate this endpoint\'s signing secret? The old one keeps working for 24 hours.')) return;
@@ -134,6 +151,28 @@ async function loadDlq() {
   )));
 }
 
+async function loadSettings() {
+  const s = await api('GET', '/api/settings');
+  $('schedule').value = (s.retry_schedule_minutes ?? []).join(', ');
+  $('scheduleHint').textContent = s.retry_schedule_minutes
+    ? `Custom schedule: ${s.retry_schedule_minutes.length} retries. Default is ${s.default_retry_schedule_minutes.join(', ')}.`
+    : `Using the default: ${s.default_retry_schedule_minutes.join(', ')} minutes. 1-10 retries, each 1-1440 minutes.`;
+}
+
+async function saveSchedule(schedule) {
+  await run(async () => {
+    await api('PUT', '/api/settings', { retry_schedule_minutes: schedule });
+    say('Retry policy saved. It applies to the next retry of every delivery.', 'ok');
+    await loadSettings();
+  });
+}
+
+$('settings').onsubmit = (e) => {
+  e.preventDefault();
+  saveSchedule($('schedule').value.split(',').map((x) => x.trim()).filter(Boolean).map(Number));
+};
+$('resetSchedule').onclick = () => saveSchedule(null);
+
 async function replay(eventId, endpointId, after) {
   await run(async () => {
     await api('POST', `/api/deliveries/${eventId}/${endpointId}/replay`);
@@ -145,7 +184,7 @@ async function replay(eventId, endpointId, after) {
 async function run(fn) { try { await fn(); } catch (err) { say(err.message, 'bad'); } }
 
 $('login').onsubmit = (e) => { e.preventDefault(); apiKey = $('key').value.trim(); run(async () => {
-  await Promise.all([loadEndpoints(), loadDlq()]);
+  await Promise.all([loadEndpoints(), loadDlq(), loadSettings()]);
   $('app').hidden = false; say('Loaded.', 'ok');
 }); };
 

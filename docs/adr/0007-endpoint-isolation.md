@@ -14,7 +14,7 @@ The spec's v2 fix was a 10-second timeout, committing after the first attempt, a
 
 Bound the time each message can spend in the consumer, and move all retrying out of the consumer:
 
-1. **One inline attempt per event, capped at 3 seconds** (`INLINE_TIMEOUT_MS` in `consumer.js`), **and a 3-second budget per endpoint per chunk** (`ENDPOINT_BUDGET_MS`). After the budget, an endpoint's remaining events in the chunk are queued for the worker without an attempt, so a slow-but-working endpoint can't hold the partition for N × timeout.
+1. **One inline attempt per event, capped at 1 second** (`INLINE_TIMEOUT_MS` in `consumer.js`), **and a 1-second budget per endpoint per chunk** (`ENDPOINT_BUDGET_MS`). After the budget, an endpoint's remaining events in the chunk are queued for the worker without an attempt, so a slow-but-working endpoint can't hold the partition for N × timeout. An inline **timeout** is queued with no delay: the worker retries it on its next poll with a longer timeout (8s), because 1 second only proves the endpoint is slow, not broken. Other failures back off normally. (Day 4: lowered from 3s after the load test showed the first 3s timeout against a newly broken endpoint degraded its whole partition for ~10s.)
 2. **Skip the inline attempt when we already know it will fail:** when the endpoint's circuit breaker isn't closed, or when the endpoint already has an earlier pending delivery (which is also needed for ordering; see ADR-008).
 3. **Different endpoints are attempted concurrently** within a chunk (`Promise.all`); one endpoint's events are attempted strictly one after another.
 4. **Retries run in `delivery-worker.js`** (ADR-002), one row per endpoint per sweep, in parallel, with a per-tenant cap. One slow endpoint's 20-second retry timeout doesn't hold up a different endpoint's retry.
@@ -22,9 +22,9 @@ Bound the time each message can spend in the consumer, and move all retrying out
 
 ## Consequences
 
-- A permanently down endpoint costs its partition at most about 3 seconds per event, until the breaker opens. After that it costs essentially nothing, because events are queued without a request.
+- A permanently down endpoint costs its partition at most about 1 second per pending cycle (in practice once, since later events queue behind the pending row), until the breaker opens. After that it costs essentially nothing.
 - **It's still not zero, and the load test shows it** (`docs/load-test-results.md` §2 and §4). In steady state, healthy endpoints are unaffected. But kafkajs fetches a partition's next batch only after the current one returns, so the **first** inline timeout against a newly broken endpoint delays everything behind it on that partition. With the batched consumer this transient lasts ~10s (healthy p95 up to ~5.8s in the first 5s). Three ways to remove it are listed in the results doc. That's an open decision.
-- The 3-second cap is tighter than the spec's 10 seconds. Endpoints that take 3 to 20 seconds to respond always go through the retry path, which has growing timeouts (5s up to 20s), so they get delivered, just later.
+- The 1-second cap is much tighter than the spec's 10 seconds. Endpoints that take 1 to 20 seconds to respond always go through the worker: the first retry is immediate, with an 8s timeout, so they're delivered within about one worker poll (≤10s) rather than inline. That's the trade: slow customers get a few seconds of extra latency so they can't stall everyone else on their partition.
 - The breaker counts failures per endpoint, regardless of cause. A poison event used to be able to open it for a healthy endpoint; since ADR-008 a healthy ping resets the count and the event is set aside after 3 attempts.
 
 ## Alternatives considered

@@ -76,6 +76,7 @@ test('Y cannot list, read, modify, rotate or replay anything of X', async () => 
     ['PATCH', `/api/endpoints/${xEndpoint}`, { is_active: false }],
     ['POST', `/api/endpoints/${xEndpoint}/rotate-secret`],
     ['POST', `/api/deliveries/${xEvent}/${xEndpoint}/replay`],
+    ['POST', `/api/endpoints/${xEndpoint}/replay-dead`, {}],
     ['POST', `/api/deliveries/${xEvent}/${yEndpoint}/replay`], // X's event onto Y's own endpoint
     ['GET', `/api/endpoints/${yEndpoint}/deliveries/${xEvent}`],
   ]) {
@@ -90,6 +91,17 @@ test('Y cannot list, read, modify, rotate or replay anything of X', async () => 
   assert.equal(ep.secret_rotated_at, null);
   const { rows: [da] } = await pool.query('SELECT status FROM delivery_attempts WHERE event_id = $1', [xEvent]);
   assert.equal(da.status, 'dead');
+});
+
+test('retry policy is per tenant: Y changing its own leaves X untouched; bad values rejected', async () => {
+  assert.equal((await call(Y, 'PUT', '/api/settings', { retry_schedule_minutes: [1, 2] })).status, 200);
+  assert.deepEqual((await call(Y, 'GET', '/api/settings')).body.retry_schedule_minutes, [1, 2]);
+  assert.equal((await call(X, 'GET', '/api/settings')).body.retry_schedule_minutes, null);
+  for (const bad of [[], [0], [99999], 'x', Array(11).fill(1)]) {
+    assert.equal((await call(Y, 'PUT', '/api/settings', { retry_schedule_minutes: bad })).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await call(Y, 'PUT', '/api/settings', { retry_schedule_minutes: null })).status, 200);
+  assert.equal((await call(Y, 'GET', '/api/settings')).body.retry_schedule_minutes, null);
 });
 
 test('endpoint registration rejects internal addresses when private endpoints are off', async () => {

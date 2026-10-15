@@ -9,18 +9,22 @@
 //   GET   /api/endpoints/:id/deliveries              recent attempt history (ledger)
 //   GET   /api/endpoints/:id/deliveries/:event_id    "what happened to my webhook"
 //   POST  /api/deliveries/:event_id/:endpoint_id/replay   one (event, endpoint) pair, never a broadcast
+//   POST  /api/endpoints/:id/replay-dead  {reason?}  re-queue this endpoint's dead letters, original order
 //   GET   /api/dlq                                   dead-lettered deliveries
+//   GET   /api/settings                              this tenant's retry policy
+//   PUT   /api/settings   {retry_schedule_minutes}   own schedule, e.g. [1, 5, 30]; null = default
 //
 // Tenant isolation: tenant_id comes ONLY from the API key, and every query filters on it.
 // Anything belonging to another tenant is a 404, same as if it didn't exist.
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { pool, encryptSecret } from './lib/infra.js';
+import { pool, encryptSecret, retryPolicy } from './lib/infra.js';
 import { getBreaker } from './lib/breaker.js';
 import { assertSafeUrl } from './lib/deliver.js';
 import { sendJson, readJson, bearer, sha256 } from './lib/http.js';
 import { generateSecret } from './core/signing.js';
+import { validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './core/backoff.js';
 
 const PORT = Number(process.env.DASHBOARD_PORT || 3001);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -160,6 +164,46 @@ const routes = [
     );
     if (!rows.length) return [409, { error: 'delivery is already pending' }];
     return [202, { event_id: eventId, endpoint_id: id, current_state: 'queued' }];
+  }],
+
+  // Bulk replay: every dead-lettered delivery of ONE endpoint (optionally one reason),
+  // e.g. after the customer fixed the handler bug behind a run of payload_rejected.
+  // Still scoped to one endpoint - never a broadcast to other endpoints.
+  ['POST', /^\/api\/endpoints\/([^/]+)\/replay-dead$/, async (t, [id], body) => {
+    await ownEndpoint(t, id);
+    const reasons = ['delivery_exhausted', 'payload_rejected', 'processing_error'];
+    if (body.reason !== undefined && !reasons.includes(body.reason)) throw badRequest(`reason must be one of ${reasons.join(', ')}`);
+    // One statement, so they all get the same created_at; the worker then breaks the
+    // tie by id, i.e. the order they were originally queued in. NOW() puts them behind
+    // anything already pending for this endpoint.
+    const { rowCount } = await pool.query(
+      `UPDATE delivery_attempts da SET
+         status = 'pending', attempt_count = 0, next_retry_at = NOW(), created_at = NOW(),
+         dead_reason = NULL, terminal_at = NULL, last_error = NULL, last_http_status = NULL,
+         processing_errors = 0, locked_until = NULL
+       FROM endpoints ep
+       WHERE da.endpoint_id = ep.endpoint_id AND ep.tenant_id = $1 AND da.endpoint_id = $2
+         AND da.status = 'dead' AND ($3::text IS NULL OR da.dead_reason = $3)`,
+      [t, id, body.reason ?? null],
+    );
+    return [202, { endpoint_id: id, reason: body.reason ?? 'any', requeued: rowCount }];
+  }],
+
+  ['GET', /^\/api\/settings$/, async (t) => {
+    const { rows: [s] } = await pool.query('SELECT retry_schedule_minutes FROM tenants WHERE tenant_id = $1', [t]);
+    return { retry_schedule_minutes: s.retry_schedule_minutes, default_retry_schedule_minutes: retryPolicy.schedule ?? DEFAULT_SCHEDULE_MINUTES };
+  }],
+
+  // Only the retry schedule is tenant-settable. Rate limits are operator-only, so a
+  // tenant can't raise its own share of ingest.
+  ['PUT', /^\/api\/settings$/, async (t, _, body) => {
+    const schedule = body.retry_schedule_minutes;
+    if (schedule !== null) {
+      const problem = validateRetrySchedule(schedule);
+      if (problem) throw badRequest(`retry_schedule_minutes ${problem}`);
+    }
+    await pool.query('UPDATE tenants SET retry_schedule_minutes = $2 WHERE tenant_id = $1', [t, schedule]);
+    return { retry_schedule_minutes: schedule, note: 'Applies to the next retry of every delivery, including ones already waiting.' };
   }],
 
   ['GET', /^\/api\/dlq$/, async (t) => {

@@ -8,7 +8,7 @@ Webhook delivery with durable accountability: every accepted event is delivered,
 docker compose up -d          # Postgres, Redis, Redpanda
 cp .env.example .env          # fill in DB creds, SECRET_ENCRYPTION_KEY, INGEST_TOKEN
 npm install
-npm run migrate               # schema + Kafka topics + signing secrets (printed once)
+npm run migrate               # schema + Kafka topics (12 partitions; grows only at zero lag) + signing secrets (printed once)
 
 npm run ingest                # :3000  POST /events
 npm run consumer              # Kafka -> inline delivery attempt
@@ -17,6 +17,7 @@ npm run retry-publisher       # re-publishes events whose Kafka publish failed
 npm run dashboard             # :3001  UI + API, dev keys: dev_key_tenant_a / dev_key_tenant_b
 
 node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for the slow one)
+npm run retention             # dry run; --apply archives (archive/*.jsonl.gz) then deletes events > RETENTION_DAYS (35)
 ```
 
 ## Tests
@@ -39,10 +40,14 @@ Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-re
 | `lib/deliver.js` | One delivery attempt: SSRF check, HMAC sign, POST, ledger row, breaker update |
 | `lib/breaker.js` | Circuit-breaker state in Redis |
 | `ingest-api.js` | Validate, dedup, archive in Postgres, publish to Kafka, then 202 |
-| `consumer.js` | Inline attempt (3s cap) or queue in `delivery_attempts` |
+| `consumer.js` | Batched inline attempts (1s cap) or queue in `delivery_attempts` |
 | `delivery-worker.js` | Leased retries, oldest-first per endpoint, backoff, DLQ |
 | `dashboard-api.js` + `public/` | Tenant API + UI |
 | `schema.sql` | Idempotent schema, also applied by `npm run migrate` |
+| `retention.js` | Archive-then-delete of events past the replay window |
+| `lib/rate-limit.js` | Per-tenant token bucket (atomic Lua script in Redis) |
+
+**Per-tenant policy:** tenants set their own retry schedule from the dashboard (`PUT /api/settings`, 1–10 retries of 1–1440 min). Operators set rate limits in the database (`tenants.rate_limit_per_sec`, `rate_limit_burst`); `NULL` means the env default.
 
 ## Receiver contract
 

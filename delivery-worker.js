@@ -1,4 +1,4 @@
-import { pool, newProducer, closeRedis, TOPICS, retryPolicy, FAST_MODE } from './lib/infra.js';
+import { pool, newProducer, closeRedis, TOPICS, retryPolicyFor, FAST_MODE } from './lib/infra.js';
 import { attemptDelivery, pingEndpoint } from './lib/deliver.js';
 import { getBreaker, reopensAt } from './lib/breaker.js';
 import { initialState } from './core/circuit-breaker.js';
@@ -51,10 +51,11 @@ async function claimDueDeliveries() {
      )
      SELECT c.id, c.event_id, c.endpoint_id, c.attempt_count, c.processing_errors,
             e.tenant_id, e.type, e.payload, e.created_at,
-            ep.url, ep.secret_encrypted, ep.secret_previous_encrypted, ep.secret_rotated_at
+            ep.url, ep.secret_encrypted, ep.secret_previous_encrypted, ep.secret_rotated_at, t.retry_schedule_minutes
      FROM claimed c
      JOIN events e ON e.event_id = c.event_id
-     JOIN endpoints ep ON ep.endpoint_id = c.endpoint_id`,
+     JOIN endpoints ep ON ep.endpoint_id = c.endpoint_id
+     JOIN tenants t ON t.tenant_id = e.tenant_id`,
     [LEASE_SECONDS, MAX_PER_TENANT],
   );
   return rows;
@@ -118,7 +119,7 @@ async function processOneDelivery(attempt) {
     console.log(`Probe after attempt ${attemptNumber}: endpoint ${endpointHealthy ? 'healthy -> event is the problem' : 'also failing -> endpoint is the problem'}:`, attempt.url);
   }
 
-  const delayMs = nextRetryDelay(attemptNumber, retryPolicy);
+  const delayMs = nextRetryDelay(attemptNumber, retryPolicyFor(attempt.retry_schedule_minutes));
   if (endpointHealthy || delayMs === null) {
     await pool.query(`UPDATE delivery_attempts SET attempt_count = $2, last_http_status = $3 WHERE id = $1`,
       [attempt.id, attemptNumber, result.httpStatus]);

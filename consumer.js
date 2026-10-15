@@ -1,12 +1,16 @@
-import { pool, kafka, newProducer, ensureTopics, closeRedis, TOPICS, retryPolicy } from "./lib/infra.js";
+import { pool, kafka, newProducer, ensureTopics, closeRedis, TOPICS, EVENT_PARTITIONS, retryPolicyFor } from "./lib/infra.js";
 import { sendSigned, recordAttempts } from "./lib/deliver.js";
-import { getBreakers, saveBreakers } from "./lib/breaker.js";
+import { getBreakers, applyOutcomes } from "./lib/breaker.js";
 import * as cb from "./core/circuit-breaker.js";
 import { nextRetryDelay } from "./core/backoff.js";
 import { validateEvent } from "./core/event.js";
 
-const INLINE_TIMEOUT_MS = 3000;   // one inline attempt never waits longer than this
-const ENDPOINT_BUDGET_MS = 3000;  // per endpoint per chunk: stop STARTING inline attempts after this
+// Kept short because Kafka fetches a partition's next batch only after this one is done:
+// the first timeout against a newly broken endpoint holds up every tenant on the
+// partition (measured: ~3s inline timeout -> ~10s of degraded latency). A timeout here
+// only means "slow", so it's retried by the worker right away with a longer timeout.
+const INLINE_TIMEOUT_MS = 1000;   // one inline attempt never waits longer than this
+const ENDPOINT_BUDGET_MS = 1000;  // per endpoint per chunk: stop STARTING inline attempts after this
 const CHUNK_SIZE = 200;           // messages per round of bookkeeping (and per offset commit)
 
 const consumer = kafka.consumer({ groupId: "delivery-workers" });
@@ -58,8 +62,10 @@ async function processChunk(messages, partition, heartbeat) {
   // 3. One query: active endpoints of every tenant in the chunk.
   const tenants = [...new Set(valid.map((e) => e.tenant_id))];
   const { rows: endpoints } = await pool.query(
-    `SELECT tenant_id, endpoint_id, url, secret_encrypted, secret_previous_encrypted, secret_rotated_at
-     FROM endpoints WHERE tenant_id = ANY($1) AND is_active = TRUE`,
+    `SELECT ep.tenant_id, ep.endpoint_id, ep.url, ep.secret_encrypted, ep.secret_previous_encrypted, ep.secret_rotated_at,
+            t.retry_schedule_minutes
+     FROM endpoints ep JOIN tenants t USING (tenant_id)
+     WHERE ep.tenant_id = ANY($1) AND ep.is_active = TRUE`,
     [tenants],
   );
   if (!endpoints.length) return;
@@ -77,10 +83,9 @@ async function processChunk(messages, partition, heartbeat) {
   //    have no ordering relationship to each other - but within one endpoint attempts
   //    are strictly sequential, and once something is queued, everything after it is
   //    queued behind it (per-endpoint order, ADR-008).
-  const ledger = [], queue = [], breakerChanges = new Map();
+  const ledger = [], queue = [], outcomes = new Map(); // endpoint_id -> [{ ok, at }]
   await Promise.all(endpoints.map(async (endpoint) => {
-    const before = breakers.get(endpoint.endpoint_id) ?? cb.initialState();
-    let breaker = before;
+    const breaker = breakers.get(endpoint.endpoint_id) ?? cb.initialState();
     // Already-known-bad endpoints get no inline attempt: let the worker handle them.
     let blocked = hasPending.has(endpoint.endpoint_id) || breaker.state !== "closed";
     const deadline = Date.now() + ENDPOINT_BUDGET_MS;
@@ -98,16 +103,18 @@ async function processChunk(messages, partition, heartbeat) {
       const result = await sendSigned(event, endpoint, INLINE_TIMEOUT_MS);
       ledger.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, tenant_id: event.tenant_id,
         attempt_number: 1, ...result, latencyMs: Date.now() - started });
-      breaker = cb.record(breaker, result.ok, Date.now());
+      if (!outcomes.has(endpoint.endpoint_id)) outcomes.set(endpoint.endpoint_id, []);
+      outcomes.get(endpoint.endpoint_id).push({ ok: result.ok, at: Date.now() });
       await heartbeat();
       if (!result.ok) {
         blocked = true;
+        // Timed out = maybe just slow: worker retries now with a longer timeout. Any
+        // other failure is a real one and backs off per the retry policy.
         queue.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, attempt_count: 1,
-          delay_ms: nextRetryDelay(1, retryPolicy), error: result.error, http_status: result.httpStatus });
+          delay_ms: result.timedOut ? 0 : nextRetryDelay(1, retryPolicyFor(endpoint.retry_schedule_minutes)), error: result.error, http_status: result.httpStatus });
         console.log("Inline attempt failed/timed out, queued for retry:", endpoint.url, "-", result.error);
       }
     }
-    if (JSON.stringify(breaker) !== JSON.stringify(before)) breakerChanges.set(endpoint.endpoint_id, { before, after: breaker });
   }));
 
   // 6. Record everything before the offset is committed (ADR-005). Queue rows go in one
@@ -127,7 +134,10 @@ async function processChunk(messages, partition, heartbeat) {
         col((q) => q.error), col((q) => q.http_status)],
     );
   }
-  await saveBreakers(breakerChanges).catch((err) => console.error("Breaker update failed:", err.message));
+  // Atomic per endpoint (compare-and-set), so outcomes reported at the same moment by
+  // workers or other consumers aren't lost.
+  await Promise.all([...outcomes].map(([id, list]) => applyOutcomes(id, list)))
+    .catch((err) => console.error("Breaker update failed:", err.message));
   console.log(`Partition ${partition}: ${valid.length} events, ${ledger.filter((l) => l.ok).length} delivered inline, ${queue.length} queued`);
 }
 
@@ -138,7 +148,7 @@ async function run() {
   await consumer.subscribe({ topic: TOPICS.events, fromBeginning: true });
 
   await consumer.run({
-    partitionsConsumedConcurrently: 3, // must be <= the topic's actual partition count
+    partitionsConsumedConcurrently: EVENT_PARTITIONS, // capped by what this consumer is assigned
     eachBatchAutoResolve: false,
     // An offset is resolved only after its chunk's ledger and queue writes succeeded,
     // so the commit is gated on the record (spec §8, ADR-005). If a chunk throws, the

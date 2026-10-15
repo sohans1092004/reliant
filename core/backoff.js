@@ -19,3 +19,11 @@ export function nextRetryDelay(attemptsMade, {
   const base = schedule[attemptsMade - 1] * unitMs;
   return Math.round(base * (1 - jitter + 2 * jitter * random()));
 }
+
+// A tenant-supplied schedule. Bounded so a tenant can't make Reliant retry forever or
+// hammer an endpoint: 1-10 retries, each 1 minute to 24 hours apart.
+export function validateRetrySchedule(schedule) {
+  if (!Array.isArray(schedule) || schedule.length < 1 || schedule.length > 10) return 'must be a list of 1-10 delays in minutes';
+  if (!schedule.every((m) => Number.isInteger(m) && m >= 1 && m <= 1440)) return 'each delay must be a whole number of minutes from 1 to 1440';
+  return null;
+}

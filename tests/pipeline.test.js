@@ -14,12 +14,12 @@ import { sha256 } from '../lib/http.js';
 import { verify } from '../core/signing.js';
 
 const INGEST = 'http://localhost:3100';
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
-const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1 };
+const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true };
 const children = [];
 let receiver, dashboardBase;
 
@@ -78,8 +78,9 @@ before(async () => {
     if (path === '/flaky' && behaviour.flakyFailuresLeft > 0) { behaviour.flakyFailuresLeft--; status = 503; }
     if (path === '/down' && behaviour.downIsDown) status = 500;
     const event = JSON.parse(body);
-    if (path === '/picky' && event.payload.bad) status = 422; // rejects one kind of event, accepts the rest
+    if (path === '/picky' && event.payload.bad && behaviour.pickyRejectsBad) status = 422; // rejects one kind of event, accepts the rest
     if (path === '/burst' && behaviour.burstFailuresLeft > 0) { behaviour.burstFailuresLeft--; status = 503; }
+    if (path === '/never') status = 500;
     received.push({ path, eventId: event.event_id, type: event.type, verified, status });
     res.writeHead(status); res.end();
   });
@@ -87,7 +88,7 @@ before(async () => {
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -213,6 +214,13 @@ test('event the endpoint keeps rejecting is set aside after a healthy ping; next
 
   const dlq = await dash('pipe_picky', 'GET', '/api/dlq');
   assert.equal(dlq.body.find((d) => d.event_id === bad)?.dead_reason, 'payload_rejected');
+
+  // The customer fixes their handler, then bulk-replays everything that was set aside.
+  behaviour.pickyRejectsBad = false;
+  assert.equal((await dash('pipe_picky', 'POST', `/api/endpoints/${endpoints.pipe_picky}/replay-dead`, { reason: 'nope' })).status, 400);
+  const replay = await dash('pipe_picky', 'POST', `/api/endpoints/${endpoints.pipe_picky}/replay-dead`, { reason: 'payload_rejected' });
+  assert.deepEqual([replay.status, replay.body.requeued], [202, 1]);
+  await waitFor(() => okFor('/picky', bad).length, 'set-aside event delivered after bulk replay');
 });
 
 test('a burst queued behind a failure in one batch is delivered in exactly the order it was accepted', async () => {
@@ -221,4 +229,12 @@ test('a burst queued behind a failure in one batch is delivered in exactly the o
   await waitFor(() => ids.every((id) => okFor('/burst', id).length), 'whole burst delivered');
   const order = received.filter((r) => r.path === '/burst' && r.status === 200).map((r) => r.eventId);
   assert.deepEqual(order, ids);
+});
+
+test("a tenant's own retry schedule replaces the global one", async () => {
+  // Global schedule in this test run is 1,1 (2 retries). This tenant allows only 1.
+  assert.equal((await dash('pipe_custom', 'PUT', '/api/settings', { retry_schedule_minutes: [1] })).status, 200);
+  const { event_id } = (await ingest('pipe_custom')).body;
+  const dead = await waitFor(async () => (await dash('pipe_custom', 'GET', '/api/dlq')).body.find((d) => d.event_id === event_id), 'dead letter');
+  assert.deepEqual([dead.dead_reason, dead.attempt_count], ['delivery_exhausted', 2]); // inline + 1 retry
 });

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { nextRetryDelay, DEFAULT_SCHEDULE_MINUTES } from './backoff.js';
+import { nextRetryDelay, validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './backoff.js';
 import * as cb from './circuit-breaker.js';
 import * as sig from './signing.js';
 import { validateEvent } from './event.js';
@@ -24,6 +24,15 @@ test('backoff: exhausted after the schedule, rejects nonsense input', () => {
   assert.throws(() => nextRetryDelay(0));
   assert.throws(() => nextRetryDelay(1.5));
   assert.equal(nextRetryDelay(1, { unitMs: 1000, jitter: 0 }), 1000); // fast mode
+});
+
+test('backoff: tenant schedules are bounded', () => {
+  assert.equal(validateRetrySchedule([1, 5, 30]), null);
+  assert.equal(validateRetrySchedule([1440]), null);
+  for (const bad of [[], [0], [1.5], [1441], ['5'], Array(11).fill(1), null, 'nope']) {
+    assert.notEqual(validateRetrySchedule(bad), null, JSON.stringify(bad));
+  }
+  assert.equal(nextRetryDelay(2, { schedule: [1], jitter: 0 }), null, 'a 1-entry schedule allows exactly 1 retry');
 });
 
 const cfg = { failureThreshold: 3, cooldownMs: 1000, halfOpenSuccesses: 2 };
