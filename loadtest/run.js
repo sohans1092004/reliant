@@ -2,11 +2,14 @@
 //   node loadtest/run.js ingest      ingest throughput ramp
 //   node loadtest/run.js isolation   delivery latency, baseline vs. one hanging endpoint
 //   node loadtest/run.js recovery    backlog drain after the consumer was offline
+//   node loadtest/run.js pg-outage   kill Postgres mid-traffic; was any accepted event lost?
+//                        (also redis-outage, kafka-outage)
 // Needs docker compose up and NO other ingest/consumer/worker running.
 // Uses its own lt_* tenants and deletes everything it created at the end.
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import { pool, closeRedis, redis, kafka, TOPICS } from '../lib/infra.js';
@@ -17,26 +20,43 @@ import { generateSecret } from '../core/signing.js';
 const INGEST = 'http://localhost:3200';
 const CHILD_ENV = { ...process.env, INGEST_PORT: '3200', RATE_LIMIT_PER_SEC: '1000000', ALLOW_PRIVATE_ENDPOINTS: 'true' };
 const children = {};
+const exits = []; // children that exited without being stopped
 const ingestPorts = [3200];
 
 // ---------- infrastructure ----------
 
 function start(name, file, env = {}) {
-  const child = spawn(process.execPath, [file], { env: { ...CHILD_ENV, ...env }, stdio: ['ignore', 'ignore', 'pipe'] });
-  child.stderr.on('data', (d) => /error/i.test(d) && !/coordinator/i.test(d) && process.stderr.write(`[${name}] ${d}`));
+  const child = spawn(process.execPath, [file], { env: { ...CHILD_ENV, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  // LT_LOG_DIR keeps each process's full output (JSON logs) for the incident timeline.
+  const logFile = process.env.LT_LOG_DIR && fs.createWriteStream(`${process.env.LT_LOG_DIR}/${name}.log`, { flags: 'a' });
+  child.stdout.on('data', (d) => logFile?.write(d));
+  child.stderr.on('data', (d) => {
+    logFile?.write(d);
+    if (/error/i.test(d) && !/coordinator/i.test(d)) process.stderr.write(`[${name}] ${d}`);
+  });
+  child.on('exit', (code, signal) => {
+    if (children[name] === child) exits.push({ name, code, signal, at: Date.now() });
+  });
   children[name] = child;
 }
 function stop(name) {
-  children[name]?.kill();
+  const child = children[name];
   delete children[name];
+  child?.kill();
 }
 
 // Customer endpoints: /ok answers immediately, /hang never answers (worst kind of broken).
 let sinkPort;
+// LT_TARGET=k8s: deliveries come from pods, which reach this machine as host.docker.internal.
+const K8S = process.env.LT_TARGET === 'k8s';
+const SINK_HOST = K8S ? 'host.docker.internal' : 'localhost';
+const received = new Map(); // webhook-id -> times received (the outage drills read it)
 async function startSink() {
   const server = http.createServer((req, res) => {
     req.resume();
     if (req.url === '/hang') return; // let the client time out
+    const id = req.headers['webhook-id'];
+    if (id) received.set(id, (received.get(id) || 0) + 1);
     req.on('end', () => { res.writeHead(200); res.end(); });
   });
   server.keepAliveTimeout = 60_000;
@@ -51,7 +71,7 @@ async function setupTenants(n, paths) {
     await pool.query('INSERT INTO tenants (tenant_id, name, api_key_hash) VALUES ($1, $1, $2)', [t, sha256(crypto.randomUUID())]);
     for (const path of paths) {
       await pool.query('INSERT INTO endpoints (tenant_id, url, secret_encrypted) VALUES ($1, $2, $3)',
-        [t, `http://localhost:${sinkPort}${path}`, encryptSecret(generateSecret())]);
+        [t, `http://${SINK_HOST}:${sinkPort}${path}`, encryptSecret(generateSecret())]);
     }
   }
   return tenants;
@@ -121,8 +141,8 @@ async function send(tenants) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.INGEST_TOKEN}` },
     body: JSON.stringify({ tenant_id: tenants[seq++ % tenants.length], type: 'load.test', payload: { n: seq } }),
   });
-  await res.arrayBuffer();
-  return { ok: res.status === 202, ms: performance.now() - started };
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.status === 202, status: res.status, eventId: body.event_id, ms: performance.now() - started };
 }
 
 // Open loop: a fixed `rate` per second for `seconds`, regardless of how slow responses are.
@@ -297,6 +317,102 @@ async function recovery() {
   console.log(`spec target: 600,000 backlog in 300s = 2,000 events/s`);
 }
 
+// Induced failure (spec Phase 4): kill -9 one dependency under steady traffic, restart it
+// LT_OUTAGE seconds later, then check end to end, at the receiver, that every event
+// ingest accepted was delivered. Fast retry mode, so the drain takes seconds, not minutes.
+//
+// LT_TARGET=k8s (postgres only) runs it against the deployed cluster instead: load goes to
+// the ingest Service (port-forward it to :3200; DB_* must point at a port-forward of the
+// postgres Service; env from k8s/local/secrets.env). Postgres is crash-stopped inside its
+// pod and Kubernetes restarts the container (emptyDir survives a container restart, not a
+// pod deletion); crashes show up as pod restart counts.
+const CONTAINERS = { postgres: 'reliant-reliant_postgres-1', redis: 'reliant-reliant_redis-1', redpanda: 'reliant-reliant_kafka-1' };
+async function outage(dep) {
+  const RATE = Number(process.env.LT_RATE || 50), OUTAGE = Number(process.env.LT_OUTAGE || 30);
+  const BEFORE = 15, AFTER = 30;
+  const container = CONTAINERS[dep];
+  const docker = (...args) => execFileSync('docker', args, { stdio: 'pipe' }).toString().trim();
+  const kubectl = (...args) => execFileSync('kubectl', ['-n', 'reliant', ...args], { stdio: 'pipe' }).toString().trim();
+  const restarts = () => kubectl('get', 'pods', '-l', 'app.kubernetes.io/name=reliant', '-o',
+    'jsonpath={range .items[*]}{.metadata.labels.app\\.kubernetes\\.io/component}={.status.containerStatuses[0].restartCount} {end}');
+  if (K8S && dep !== 'postgres') throw new Error('LT_TARGET=k8s supports pg-outage only');
+  const t0 = Date.now(), at = () => `t+${((Date.now() - t0) / 1000).toFixed(1)}s`;
+  const say = (msg) => console.log(`${at().padEnd(9)} ${msg}`);
+
+  const tenants = await setupTenants(10, ['/ok']);
+  const env = { RETRY_FAST_MODE: 'true' };
+  if (!K8S) for (const [name, file] of [['ingest', 'ingest-api.js'], ['consumer', 'consumer.js'],
+    ['worker', 'delivery-worker.js'], ['retry-publisher', 'retry-publisher.js']]) start(name, file, env);
+  const restartsBefore = K8S && restarts();
+  await waitFor(() => fetch(`${INGEST}/health`).then((r) => r.ok, () => false), 'ingest up');
+  await warmUp(tenants);
+  received.clear();
+
+  // Open loop, recording every response. A connection error counts as status 0.
+  const responses = []; // { t, status, eventId }
+  const inflight = new Set();
+  let stopLoad = false;
+  const load = (async () => {
+    while (!stopLoad) {
+      const t = Date.now() - t0;
+      const p = send(tenants).catch(() => ({ status: 0 }))
+        .then((r) => responses.push({ t, status: r.status, eventId: r.eventId }))
+        .finally(() => inflight.delete(p));
+      inflight.add(p);
+      await sleep(1000 / RATE);
+    }
+    await Promise.all(inflight);
+  })();
+  const ticker = setInterval(() => {
+    const last = responses.filter((r) => r.t > Date.now() - t0 - 5000);
+    const by = Object.entries(Object.groupBy(last, (r) => r.status)).map(([s, rs]) => `${s}:${rs.length}`).join(' ');
+    say(`last 5s responses ${by || '-'} | in flight ${inflight.size} | received ${received.size} | alive ${Object.keys(children).filter((n) => !exits.some((e) => e.name === n)).join(',')}`);
+  }, 5000);
+
+  console.log(`\n${dep} outage: ${RATE} events/s, kill -9 at t+${BEFORE}s, restart after ${OUTAGE}s`);
+  await sleep(BEFORE * 1000);
+  if (K8S) {
+    // The exec session dies with the container, so kubectl may report an error here.
+    try { kubectl('exec', 'deploy/postgres', '--', 'sh', '-c', 'gosu postgres /usr/lib/postgresql/16/bin/pg_ctl stop -m immediate'); } catch {}
+    say('postgres crash-stopped in its pod; Kubernetes restarts the container');
+    await sleep(OUTAGE * 1000);
+  } else {
+    docker('kill', container);
+    say(`${dep} killed`);
+    await sleep(OUTAGE * 1000);
+    docker('start', container);
+    say(`${dep} started`);
+  }
+  await sleep(AFTER * 1000);
+  stopLoad = true;
+  await load;
+  clearInterval(ticker);
+  say(`load stopped: ${responses.length} requests`);
+
+  // Every event ingest answered 202 for (and 503 "saved, not queued") must reach the receiver.
+  const promised = new Set(responses.filter((r) => r.status === 202 || (r.status === 503 && r.eventId)).map((r) => r.eventId));
+  const missing = () => [...promised].filter((id) => !received.has(id));
+  await waitFor(async () => missing().length === 0, 'all accepted events delivered', 180_000).catch(() => {});
+  say('drain finished');
+
+  const status = Object.groupBy(responses, (r) => r.status);
+  const firstFail = responses.find((r) => r.status !== 202);
+  const lastFail = responses.findLast((r) => r.status !== 202);
+  console.log('\n--- result ---');
+  console.log('responses by status:', Object.fromEntries(Object.entries(status).map(([s, rs]) => [s, rs.length])));
+  if (firstFail) console.log(`non-202 window: t+${(firstFail.t / 1000).toFixed(1)}s .. t+${(lastFail.t / 1000).toFixed(1)}s`);
+  console.log(`accepted (202 + 503-saved): ${promised.size}, delivered at receiver: ${[...promised].filter((id) => received.has(id)).length}, NOT DELIVERED within drain timeout: ${missing().length}`);
+  console.log(`duplicate deliveries (same webhook-id twice): ${[...received.values()].filter((n) => n > 1).length}`);
+  const unexpected = [...received.keys()].filter((id) => !promised.has(id)).length;
+  console.log(`delivered but never acknowledged to the client (client saw an error): ${unexpected}`);
+  if (K8S) console.log(`pod restarts before: ${restartsBefore}
+pod restarts after:  ${restarts()}`);
+  else console.log('process exits:', exits.length ? exits.map((e) => `${e.name} code=${e.code} at t+${((e.at - t0) / 1000).toFixed(1)}s`).join('; ') : 'none');
+  const { rows } = await pool.query(`SELECT status, count(*)::int AS n FROM delivery_attempts da JOIN endpoints ep USING (endpoint_id)
+    WHERE ep.tenant_id LIKE 'lt\\_%' GROUP BY status`);
+  console.log('delivery_attempts rows:', Object.fromEntries(rows.map((r) => [r.status, r.n])));
+}
+
 // ---------- main ----------
 
 if (!isMainThread) { // a load-generator thread started by threadedLoop
@@ -314,13 +430,14 @@ if (!isMainThread) { // a load-generator thread started by threadedLoop
   process.exit(0);
 }
 
-const scenarios = { ingest: ingestRamp, isolation, recovery };
+const scenarios = { ingest: ingestRamp, isolation, recovery, 
+  'pg-outage': () => outage('postgres'), 'redis-outage': () => outage('redis'), 'kafka-outage': () => outage('redpanda') };
 const name = process.argv[2];
 if (!scenarios[name]) {
   console.log(`usage: node loadtest/run.js ${Object.keys(scenarios).join('|')}`);
   process.exit(1);
 }
-const lag = await consumerLag();
+const lag = K8S ? 0 : await consumerLag(); // the in-cluster broker isn't reachable from here
 if (lag > 0) {
   console.error(`delivery-workers has ${lag} unconsumed messages. Run the consumer until it catches up first;`);
   console.error('the load test would otherwise mix them into its measurements.');

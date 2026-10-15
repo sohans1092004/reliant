@@ -10,6 +10,17 @@ groups:
         annotations:
           summary: "{{ $labels.process }} is not answering metrics scrapes"
 
+      # Added after incident 001: 30s of every ingest request failing paged no one.
+      # 4xx are the client's problem; 5xx means events are being turned away.
+      - alert: ReliantIngestErrors
+        expr: |
+          sum(rate(reliant_ingest_requests_total{status=~"5.."}[2m]))
+            / sum(rate(reliant_ingest_requests_total[2m])) > 0.05
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of ingest requests are failing (5xx)"
+
       - alert: ReliantDLQDepthHigh
         expr: sum(reliant_dlq_depth) > 1000
         for: 10m

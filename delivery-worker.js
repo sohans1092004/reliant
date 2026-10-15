@@ -224,13 +224,15 @@ async function processSafely(attempt) {
 let stopping = false;
 let currentSweep = Promise.resolve();
 
+// Returns how many rows it claimed: while there's due work, the next sweep starts right away.
 async function sweep() {
   const rows = await claimDueDeliveries();
-  if (rows.length === 0) return;
+  if (rows.length === 0) return 0;
   log.info('claimed due deliveries', { count: rows.length });
   // Different rows here are for DIFFERENT endpoints (the query guarantees that),
   // so they have no ordering relationship to each other - safe to run at once.
   await Promise.all(rows.map(processSafely));
+  return rows.length;
 }
 
 async function run() {
@@ -255,8 +257,14 @@ async function run() {
   async function tick() {
     if (isRunning || stopping) return;
     isRunning = true;
-    currentSweep = sweep().catch((err) => log.error('sweep failed', { err }));
-    await currentSweep;
+    // Keep sweeping while there's due work. Each sweep takes ONE row per endpoint (ordering),
+    // so waiting POLL_MS between sweeps capped a backlogged endpoint at one delivery per
+    // 10s: 73 queued events took 12 minutes after the Redis drill (incident 002).
+    let claimed;
+    do {
+      currentSweep = sweep().catch((err) => { log.error('sweep failed', { err }); return 0; });
+      claimed = await currentSweep;
+    } while (claimed > 0 && !stopping);
     isRunning = false;
   }
 

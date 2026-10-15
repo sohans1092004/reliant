@@ -15,6 +15,21 @@ images:
     newName: reliant
     newTag: dev # built locally; Docker Desktop's cluster sees local images (kind: `kind load docker-image reliant:dev`)
 
+# The tag never changes locally, so with the default (IfNotPresent) the node kept running
+# the first reliant:dev it saw: a rebuilt image plus `rollout restart` silently ran the
+# old code (found by incident 001's Kubernetes drill). Always re-resolves the tag.
+patches:
+  - target: { kind: Deployment, labelSelector: app.kubernetes.io/name=reliant }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+  - target: { kind: Job, labelSelector: app.kubernetes.io/name=reliant }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+
 configMapGenerator:
   - name: reliant-config
     literals:

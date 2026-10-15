@@ -6,7 +6,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { pool, newProducer, publishEvent, ensureTopics, closeRedis } from './lib/infra.js';
+import { pool, newProducer, publishEvent, ensureTopics, closeRedis, isUnavailable } from './lib/infra.js';
 import { sendJson, readJson, bearer, safeEqual } from './lib/http.js';
 import { takeToken } from './lib/rate-limit.js';
 import { log } from './lib/log.js';
@@ -86,6 +86,7 @@ async function ingest(req, res) {
   } catch (err) {
     // Saved but not published: retry-publisher will pick it up, and a client retry is safe.
     log.error('kafka publish failed, retry-publisher will finish it', { event_id: eventId, tenant_id: body.tenant_id, err });
+    res.setHeader('Retry-After', '5');
     return sendJson(res, 503, { error: 'accepted into storage but not yet queued; retry is safe', event_id: eventId });
   }
   return sendJson(res, inserted[0] ? 202 : 200, { event_id: eventId, duplicate: !inserted[0] });
@@ -104,6 +105,11 @@ export const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') return sendJson(res, 200, { ok: true });
     sendJson(res, 404, { error: 'not found' });
   } catch (err) {
+    if (!err.status && isUnavailable(err)) { // Postgres down: nothing was stored, a retry is safe
+      log.warn('ingest refused, storage unavailable', { err });
+      res.setHeader('Retry-After', '5');
+      return sendJson(res, 503, { error: 'storage temporarily unavailable; retry is safe' });
+    }
     if (!err.status) log.error('ingest error', { err, stack: err.stack });
     sendJson(res, err.status || 500, { error: err.status ? err.message : 'internal error' });
   }

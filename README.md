@@ -51,9 +51,12 @@ npm test                      # core: backoff, circuit breaker, signing, validat
 npm run test:integration      # needs docker compose up and no consumer/worker running:
                               # tenant isolation + full pipeline end to end
 npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for multi-process
+npm run loadtest -- pg-outage # kill Postgres mid-traffic (docker on PATH); also redis-outage, kafka-outage
+bash loadtest/k8s-pg-outage.sh # the same Postgres drill against the k8s/local deployment
 ```
 
 Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
+Induced-failure postmortems: [`production/incident-reports/`](production/incident-reports/).
 
 ## Observability
 
