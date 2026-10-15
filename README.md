@@ -25,7 +25,10 @@ node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for t
 npm test                      # core: backoff, circuit breaker, signing, validation (no I/O)
 npm run test:integration      # needs docker compose up and no consumer/worker running:
                               # tenant isolation + full pipeline end to end
+npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for multi-process
 ```
+
+Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
 
 ## Layout
 
@@ -60,4 +63,4 @@ Smaller deviations:
 
 - **A clean inline success writes only a ledger row, not a `delivery_attempts` row.** The status API falls back to the ledger.
 - **Ingest dedups on the `events.event_id` primary key only.** There's no Redis fast path in front of it, since the PK index check is already cheap.
-- **Not built (needs AWS / real infra):** Kubernetes, Terraform, CI/CD, load tests (§14), OpenTelemetry/metrics, ledger time-partitioning, per-tenant retry policies.
+- **Not built (needs AWS / real infra):** Kubernetes, Terraform, CI/CD, OpenTelemetry/metrics, ledger time-partitioning, per-tenant retry policies.
