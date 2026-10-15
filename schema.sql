@@ -10,6 +10,13 @@ CREATE TABLE IF NOT EXISTS tenants (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-tenant policy. NULL = use the global default (env).
+-- Retry schedule: settable by the tenant from the dashboard.
+-- Rate limit: operator-only (a tenant must not be able to raise its own limit).
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS retry_schedule_minutes INT[];
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rate_limit_per_sec INT CHECK (rate_limit_per_sec > 0);
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS rate_limit_burst INT CHECK (rate_limit_burst > 0);
+
 -- Durable event archive - independent of Kafka retention, which is what makes
 -- replaying a 3-week-old event possible (ADR-001). Rows are never deleted.
 -- status here only means "reached Kafka", NOT "reached the customer".

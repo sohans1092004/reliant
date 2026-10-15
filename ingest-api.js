@@ -6,27 +6,35 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { pool, redis, newProducer, publishEvent, ensureTopics } from './lib/infra.js';
+import { pool, newProducer, publishEvent, ensureTopics } from './lib/infra.js';
 import { sendJson, readJson, bearer, safeEqual } from './lib/http.js';
+import { takeToken } from './lib/rate-limit.js';
 import { validateEvent } from './core/event.js';
 
 const PORT = Number(process.env.INGEST_PORT || 3000);
 const RATE_LIMIT_PER_SEC = Number(process.env.RATE_LIMIT_PER_SEC || 1000);
+const RATE_LIMIT_BURST = Number(process.env.RATE_LIMIT_BURST || RATE_LIMIT_PER_SEC * 2);
 const producer = newProducer();
 
-// Per-tenant rate limit, so one tenant's spike can't starve the rest (spec §9.7).
-// ponytail: fixed 1-second window, allows up to 2x burst at a window edge. Swap for a
-// Lua token bucket if that burst matters. Fails open if Redis is down.
+// Per-tenant limits (tenants.rate_limit_*, NULL = env default). Cached for 30s so the
+// hot path doesn't pay a Postgres round trip per request; a changed limit applies
+// within 30s.
+const limitCache = new Map();
+async function tenantLimits(tenantId) {
+  const hit = limitCache.get(tenantId);
+  if (hit && hit.expires > Date.now()) return hit;
+  const { rows: [t] } = await pool.query('SELECT rate_limit_per_sec, rate_limit_burst FROM tenants WHERE tenant_id = $1', [tenantId]);
+  const rate = t?.rate_limit_per_sec ?? RATE_LIMIT_PER_SEC;
+  const limits = { rate, burst: t?.rate_limit_burst ?? Math.max(RATE_LIMIT_BURST, rate), expires: Date.now() + 30_000 };
+  if (limitCache.size > 10_000) limitCache.clear();
+  limitCache.set(tenantId, limits);
+  return limits;
+}
+
+// Per-tenant token bucket, so one tenant's spike can't starve the rest (spec §9.7).
 async function overRateLimit(tenantId) {
-  try {
-    const r = await redis();
-    const key = `rl:${tenantId}:${Math.floor(Date.now() / 1000)}`;
-    const count = await r.incr(key);
-    if (count === 1) await r.expire(key, 2);
-    return count > RATE_LIMIT_PER_SEC;
-  } catch {
-    return false;
-  }
+  const { rate, burst } = await tenantLimits(tenantId);
+  return !(await takeToken(tenantId, rate, burst));
 }
 
 async function ingest(req, res) {
@@ -37,7 +45,10 @@ async function ingest(req, res) {
   const problems = validateEvent(body);
   if (problems.length) return sendJson(res, 400, { error: 'invalid event', problems });
 
-  if (await overRateLimit(body.tenant_id)) return sendJson(res, 429, { error: 'rate limit exceeded' });
+  if (await overRateLimit(body.tenant_id)) {
+    res.setHeader('Retry-After', '1');
+    return sendJson(res, 429, { error: 'rate limit exceeded' });
+  }
 
   const eventId = body.event_id || crypto.randomUUID();
   // First durability boundary. The PK makes a re-submitted event_id a no-op, and the
