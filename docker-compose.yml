@@ -1,0 +1,33 @@
+services:
+  # Durable storage: events, delivery ledger, DLQ live here permanently.
+  reliant_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: reliant
+      POSTGRES_PASSWORD: reliant_dev_password
+      POSTGRES_DB: reliant
+    ports:
+      - "5432:5432"
+    volumes:
+      # Runs only when the DB volume is empty (first start / after a wipe).
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  # Fast, temporary memory: circuit-breaker state, rate-limit counters, later on.
+  reliant_redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  # Kafka-compatible message queue (Redpanda), single container, no Zookeeper needed.
+  reliant_kafka:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"

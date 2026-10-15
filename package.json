@@ -1,0 +1,25 @@
+{
+  "name": "reliant",
+  "version": "1.0.0",
+  "description": "Distributed webhook & event delivery platform",
+  "scripts": {
+    "test": "node --test \"core/*.test.js\"",
+    "test:integration": "node --test \"tests/*.test.js\"",
+    "migrate": "node migrate.js",
+    "ingest": "node ingest-api.js",
+    "consumer": "node consumer.js",
+    "worker": "node delivery-worker.js",
+    "retry-publisher": "node retry-publisher.js",
+    "dashboard": "node dashboard-api.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^18.0.0",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.23.0",
+    "redis": "^4.7.0"
+  }
+}

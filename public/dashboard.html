@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliant Dashboard</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1a1a1a; --muted:#666; --line:#ddd; --card:#fff; --ok:#1a7f37; --bad:#c62828; --warn:#a15c00; --accent:#2457d6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141414; --fg:#eee; --muted:#999; --line:#333; --card:#1d1d1d; --ok:#4cc26a; --bad:#ff6b6b; --warn:#f0a940; --accent:#7aa2ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 16px; } h2 { font-size:16px; margin:24px 0 8px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin-bottom:16px; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; } th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  code { font-size:12px; word-break:break-all; }
+  input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:0; }
+  button { font:inherit; padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--accent); } button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .grow { flex:1; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .muted { color:var(--muted); }
+  .secret { background:var(--bg); border:1px dashed var(--warn); padding:8px; border-radius:6px; margin-top:8px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reliant: webhook deliveries</h1>
+
+  <section>
+    <form id="login" class="row">
+      <label for="key">Tenant API key</label>
+      <input id="key" class="grow" type="password" autocomplete="off" placeholder="dev_key_tenant_a">
+      <button>Load</button>
+    </form>
+    <p id="status" class="muted" role="status"></p>
+  </section>
+
+  <div id="app" hidden>
+    <h2>Endpoints</h2>
+    <section>
+      <table><thead><tr><th>URL</th><th>Active</th><th>Circuit</th><th></th></tr></thead><tbody id="endpoints"></tbody></table>
+      <form id="create" class="row" style="margin-top:12px">
+        <input id="newUrl" class="grow" type="url" required placeholder="https://example.com/webhooks" aria-label="New endpoint URL">
+        <button>Add endpoint</button>
+      </form>
+      <div id="secretBox" class="secret" hidden></div>
+    </section>
+
+    <h2 id="historyTitle">Delivery history</h2>
+    <section>
+      <p id="historyHint" class="muted">Pick an endpoint above to see its attempts.</p>
+      <table hidden id="historyTable"><thead><tr><th>When</th><th>Event</th><th>Type</th><th>#</th><th>Result</th><th>Latency</th><th></th></tr></thead><tbody id="history"></tbody></table>
+    </section>
+
+    <h2>Dead letters</h2>
+    <section>
+      <p id="dlqEmpty" class="muted">Nothing here.</p>
+      <table hidden id="dlqTable"><thead><tr><th>When</th><th>Event</th><th>Endpoint</th><th>Reason</th><th>Last error</th><th></th></tr></thead><tbody id="dlq"></tbody></table>
+    </section>
+  </div>
+</main>
+
+<script>
+let apiKey = '';
+const $ = (id) => document.getElementById(id);
+const say = (msg, cls = 'muted') => { $('status').textContent = msg; $('status').className = cls; };
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { Authorization: `Bearer ${apiKey}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+// Build DOM with textContent only - URLs and errors are customer-controlled.
+function el(tag, text, cls) { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
+function btn(label, onClick) { const b = el('button', label); b.type = 'button'; b.onclick = onClick; return b; }
+function tr(...cells) { const r = document.createElement('tr'); for (const c of cells) { const td = document.createElement('td'); c instanceof Node ? td.append(c) : td.textContent = c ?? ''; r.append(td); } return r; }
+const when = (t) => t ? new Date(t).toLocaleString() : '';
+const short = (id) => el('code', id.slice(0, 8), null);
+
+function showSecret(secret, note) {
+  const box = $('secretBox');
+  box.replaceChildren(el('strong', 'Signing secret: '), el('code', secret), el('div', note, 'muted'));
+  box.hidden = false;
+}
+
+async function loadEndpoints() {
+  const eps = await api('GET', '/api/endpoints');
+  $('endpoints').replaceChildren(...eps.map((ep) => {
+    const circuitCls = ep.circuit === 'closed' ? 'ok' : ep.circuit === 'open' ? 'bad' : 'warn';
+    const actions = el('div', null, 'row');
+    actions.append(
+      btn('History', () => loadHistory(ep)),
+      btn(ep.is_active ? 'Disable' : 'Enable', () => run(async () => { await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { is_active: !ep.is_active }); await loadEndpoints(); })),
+      btn('Rotate secret', () => run(async () => {
+        if (!confirm('Rotate this endpoint\'s signing secret? The old one keeps working for 24 hours.')) return;
+        const r = await api('POST', `/api/endpoints/${ep.endpoint_id}/rotate-secret`);
+        showSecret(r.secret, r.note);
+      })),
+    );
+    return tr(el('code', ep.url), ep.is_active ? 'yes' : 'no', el('span', ep.circuit, circuitCls), actions);
+  }));
+}
+
+async function loadHistory(ep) {
+  const rows = await api('GET', `/api/endpoints/${ep.endpoint_id}/deliveries`);
+  $('historyTitle').textContent = `Delivery history: ${ep.url}`;
+  $('historyHint').textContent = rows.length ? '' : 'No attempts yet.';
+  $('historyTable').hidden = !rows.length;
+  $('history').replaceChildren(...rows.map((r) => tr(
+    when(r.attempted_at), short(r.event_id), r.type, r.attempt_number,
+    el('span', r.status === 'delivered' ? `delivered ${r.http_status_code}` : (r.error_detail || 'failed'), r.status === 'delivered' ? 'ok' : 'bad'),
+    r.latency_ms != null ? `${r.latency_ms} ms` : '',
+    btn('Replay', () => replay(r.event_id, ep.endpoint_id, () => loadHistory(ep))),
+  )));
+}
+
+async function loadDlq() {
+  const rows = await api('GET', '/api/dlq');
+  $('dlqEmpty').hidden = rows.length > 0;
+  $('dlqTable').hidden = !rows.length;
+  $('dlq').replaceChildren(...rows.map((r) => tr(
+    when(r.terminal_at), short(r.event_id), el('code', r.url),
+    el('span', r.dead_reason, 'bad'), r.last_error,
+    btn('Replay', () => replay(r.event_id, r.endpoint_id, loadDlq)),
+  )));
+}
+
+async function replay(eventId, endpointId, after) {
+  await run(async () => {
+    await api('POST', `/api/deliveries/${eventId}/${endpointId}/replay`);
+    say(`Replay queued for event ${eventId.slice(0, 8)} (this endpoint only).`, 'ok');
+    await after();
+  });
+}
+
+async function run(fn) { try { await fn(); } catch (err) { say(err.message, 'bad'); } }
+
+$('login').onsubmit = (e) => { e.preventDefault(); apiKey = $('key').value.trim(); run(async () => {
+  await Promise.all([loadEndpoints(), loadDlq()]);
+  $('app').hidden = false; say('Loaded.', 'ok');
+}); };
+
+$('create').onsubmit = (e) => { e.preventDefault(); run(async () => {
+  const r = await api('POST', '/api/endpoints', { url: $('newUrl').value });
+  $('newUrl').value = '';
+  showSecret(r.secret, r.note);
+  await loadEndpoints();
+}); };
+</script>
+</body>
+</html>
