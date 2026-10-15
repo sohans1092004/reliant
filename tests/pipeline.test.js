@@ -14,11 +14,11 @@ import { sha256 } from '../lib/http.js';
 import { verify } from '../core/signing.js';
 
 const INGEST = 'http://localhost:3100';
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
-const received = [];     // { path, eventId, verified, status }
+const received = [];     // { path, eventId, type, verified, status }
 const behaviour = { flakyFailuresLeft: 2, downIsDown: true };
 const children = [];
 let receiver, dashboardBase;
@@ -77,14 +77,16 @@ before(async () => {
     let status = 200;
     if (path === '/flaky' && behaviour.flakyFailuresLeft > 0) { behaviour.flakyFailuresLeft--; status = 503; }
     if (path === '/down' && behaviour.downIsDown) status = 500;
-    received.push({ path, eventId: JSON.parse(body).event_id, verified, status });
+    const event = JSON.parse(body);
+    if (path === '/picky' && event.payload.bad) status = 422; // rejects one kind of event, accepts the rest
+    received.push({ path, eventId: event.event_id, type: event.type, verified, status });
     res.writeHead(status); res.end();
   });
   await new Promise((r) => receiver.listen(0, r));
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -192,4 +194,22 @@ test('circuit breaker opens after 5 consecutive failures and stops hitting the e
   const { rows } = await pool.query(
     `SELECT count(*)::int AS n FROM delivery_attempts WHERE endpoint_id = $1 AND status = 'pending'`, [endpoints.pipe_down]);
   assert.ok(rows[0].n >= 1, 'work should be parked, not lost');
+});
+
+test('event the endpoint keeps rejecting is set aside after a healthy ping; next event goes through', async () => {
+  const bad = (await ingest('pipe_picky', { payload: { bad: true } })).body.event_id;
+  await waitFor(async () => (await pool.query('SELECT 1 FROM delivery_attempts WHERE event_id = $1', [bad])).rowCount, 'bad event queued');
+  const good = (await ingest('pipe_picky')).body.event_id;
+
+  await waitFor(() => okFor('/picky', good).length, 'good event delivered after the bad one was set aside');
+  const { rows: [row] } = await pool.query('SELECT status, dead_reason, attempt_count FROM delivery_attempts WHERE event_id = $1', [bad]);
+  assert.deepEqual(row, { status: 'dead', dead_reason: 'payload_rejected', attempt_count: 3 });
+
+  const picky = received.filter((r) => r.path === '/picky');
+  assert.ok(picky.some((r) => r.type === 'reliant.ping' && r.status === 200 && r.verified), 'a signed ping was sent');
+  const goodAt = picky.findIndex((r) => r.eventId === good);
+  assert.ok(picky.slice(0, goodAt).filter((r) => r.eventId === bad).length === 3, 'good event waited for all 3 attempts on the bad one');
+
+  const dlq = await dash('pipe_picky', 'GET', '/api/dlq');
+  assert.equal(dlq.body.find((d) => d.event_id === bad)?.dead_reason, 'payload_rejected');
 });

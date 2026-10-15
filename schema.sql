@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
   last_error    TEXT
 );
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS last_http_status  INT;
-ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS dead_reason       TEXT;  -- delivery_exhausted | processing_error
+ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS dead_reason       TEXT;  -- delivery_exhausted | payload_rejected | processing_error
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS terminal_at       TIMESTAMPTZ;
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS locked_until      TIMESTAMPTZ;  -- worker lease
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS processing_errors INT NOT NULL DEFAULT 0;

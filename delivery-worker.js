@@ -1,5 +1,5 @@
 import { pool, newProducer, closeRedis, TOPICS, retryPolicy, FAST_MODE } from './lib/infra.js';
-import { attemptDelivery } from './lib/deliver.js';
+import { attemptDelivery, pingEndpoint } from './lib/deliver.js';
 import { getBreaker, reopensAt } from './lib/breaker.js';
 import { initialState } from './core/circuit-breaker.js';
 import { nextRetryDelay } from './core/backoff.js';
@@ -8,6 +8,8 @@ const POLL_MS = Number(process.env.WORKER_POLL_MS || 10_000);
 const LEASE_SECONDS = 60;            // must exceed the largest timeout below + ledger write
 const MAX_PER_TENANT = Number(process.env.MAX_PER_TENANT_PER_SWEEP || 10);
 const MAX_PROCESSING_ERRORS = 3;     // poison-pill threshold (spec §9.11)
+const PROBE_AFTER = 3;               // failed attempts before checking endpoint vs event (inline + 2 retries, ~6 min)
+const PING_TIMEOUT_MS = 5000;        // largest attempt timeout (20s) + this + writes must stay under the lease
 
 // Grows with each attempt: give a genuinely-slow-but-working endpoint more
 // room on later tries, instead of judging it against the same fixed cutoff
@@ -106,11 +108,22 @@ async function processOneDelivery(attempt) {
     return;
   }
 
+  // Endpoint problem or event problem? From PROBE_AFTER failures on, ping the endpoint.
+  // Healthy ping = the endpoint works but keeps refusing THIS event: set it aside so it
+  // stops blocking every later event for this endpoint (ADR-008). Failed ping = the
+  // endpoint is down: keep this event at the head and keep backing off.
+  let endpointHealthy = false;
+  if (attemptNumber >= PROBE_AFTER) {
+    endpointHealthy = (await pingEndpoint(attempt, attempt.tenant_id, PING_TIMEOUT_MS)).ok;
+    console.log(`Probe after attempt ${attemptNumber}: endpoint ${endpointHealthy ? 'healthy -> event is the problem' : 'also failing -> endpoint is the problem'}:`, attempt.url);
+  }
+
   const delayMs = nextRetryDelay(attemptNumber, retryPolicy);
-  if (delayMs === null) {
+  if (endpointHealthy || delayMs === null) {
     await pool.query(`UPDATE delivery_attempts SET attempt_count = $2, last_http_status = $3 WHERE id = $1`,
       [attempt.id, attemptNumber, result.httpStatus]);
-    await deadLetter(attempt, 'delivery_exhausted', result.error);
+    await deadLetter(attempt, endpointHealthy ? 'payload_rejected' : 'delivery_exhausted',
+      endpointHealthy ? `${result.error} (endpoint answered a ping fine, so this event is the problem)` : result.error);
     return;
   }
   await pool.query(
