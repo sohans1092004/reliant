@@ -1,0 +1,279 @@
+# Reliant itself. Environment-agnostic: config comes from the reliant-config ConfigMap
+# and reliant-secrets Secret, which each overlay (k8s/local, later AWS) provides.
+# Every process is the same image with a different command.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: ingest }
+spec:
+  replicas: 2 # stateless; scale freely (one process tops out near ~950 events/s)
+  selector:
+    matchLabels: { app.kubernetes.io/component: ingest }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: ingest }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9100" }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30 # lib/shutdown.js force-exits at 25s
+      # Off: Kubernetes would inject e.g. INGEST_PORT=tcp://10.x.x.x:3000 for the "ingest"
+      # Service, clobbering the app's own INGEST_PORT (it crash-looped with port NaN).
+      enableServiceLinks: false
+      containers:
+        - name: ingest
+          image: reliant
+          command: ["node", "ingest-api.js"]
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: metrics, containerPort: 9100 }
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 250m, memory: 128Mi }
+            limits: { memory: 256Mi } # no CPU limit: throttling would just add latency
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: consumer }
+spec:
+  # Useful up to the partition count (EVENT_PARTITIONS = 12); beyond that, consumers idle.
+  # Autoscaling on consumer lag is ADR-006 (not decided yet).
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/component: consumer }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: consumer }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9101" }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: consumer
+          image: reliant
+          command: ["node", "consumer.js"]
+          ports:
+            - { name: metrics, containerPort: 9101 }
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          # The metrics server runs on the same event loop, so it answering means the
+          # process isn't wedged. (It can't tell "stuck on Kafka" apart - lag alerts do.)
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 500m, memory: 192Mi } # CPU-bound under load (docs/load-test-results.md)
+            limits: { memory: 384Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: worker }
+spec:
+  replicas: 2 # row leases make any number of workers safe
+  selector:
+    matchLabels: { app.kubernetes.io/component: worker }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: worker }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9102" }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: worker
+          image: reliant
+          command: ["node", "delivery-worker.js"]
+          ports:
+            - { name: metrics, containerPort: 9102 }
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: dashboard }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/component: dashboard }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: dashboard }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9103" }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: dashboard
+          image: reliant
+          command: ["node", "dashboard-api.js"]
+          ports:
+            - { name: http, containerPort: 3001 }
+            - { name: metrics, containerPort: 9103 }
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retry-publisher
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: retry-publisher }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/component: retry-publisher }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: retry-publisher }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9104" }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: retry-publisher
+          image: reliant
+          command: ["node", "retry-publisher.js"]
+          ports:
+            - { name: metrics, containerPort: 9104 }
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# Schema + Kafka topics. Safe to re-run (migrate.js is idempotent). Retries while
+# Postgres/Kafka are still starting.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: migrate }
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: migrate }
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: reliant
+          command: ["node", "migrate.js"]
+          envFrom:
+            - configMapRef: { name: reliant-config }
+            - secretRef: { name: reliant-secrets }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest
+  labels: { app.kubernetes.io/name: reliant }
+spec:
+  selector: { app.kubernetes.io/component: ingest }
+  ports:
+    - { name: http, port: 3000, targetPort: http }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  labels: { app.kubernetes.io/name: reliant }
+spec:
+  selector: { app.kubernetes.io/component: dashboard }
+  ports:
+    - { name: http, port: 3001, targetPort: http }

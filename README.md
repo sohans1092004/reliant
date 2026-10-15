@@ -8,7 +8,7 @@ Webhook delivery with durable accountability: every accepted event is delivered,
 docker compose up -d          # Postgres, Redis, Redpanda
 cp .env.example .env          # fill in DB creds, SECRET_ENCRYPTION_KEY, INGEST_TOKEN
 npm install
-npm run migrate               # schema + Kafka topics (12 partitions; grows only at zero lag) + signing secrets (printed once)
+npm run migrate               # schema + Kafka topics (12 partitions; grows only at zero lag) + signing secrets (get one via "Rotate secret")
 
 npm run ingest                # :3000  POST /events
 npm run consumer              # Kafka -> inline delivery attempt
@@ -19,6 +19,24 @@ npm run dashboard             # :3001  UI + API, dev keys: dev_key_tenant_a / de
 node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for the slow one)
 npm run retention             # dry run; --apply archives (archive/*.jsonl.gz) then deletes events > RETENTION_DAYS (35)
 ```
+
+## Containers and Kubernetes
+
+One image runs every process; each Kubernetes Deployment just runs a different command.
+
+```sh
+docker build -t reliant:dev .
+docker run --rm reliant:dev node consumer.js        # any of the five processes
+
+# Local cluster (Docker Desktop: Settings -> Kubernetes -> Enable)
+cp k8s/local/secrets.env.example k8s/local/secrets.env   # fill in values
+kubectl apply -k k8s/local                                # app + in-cluster Postgres/Redis/Redpanda
+kubectl -n reliant port-forward svc/dashboard 3001       # http://localhost:3001
+```
+
+- `k8s/app/`: Reliant itself, environment-agnostic. Five Deployments, ingest and dashboard Services, and a `migrate` Job that is safe to re-run. Every pod runs non-root with a read-only root filesystem, drops all capabilities, and has probes and resource requests.
+- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda with no persistence (dev only), plus config and secrets. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
+- Every process shuts down gracefully on SIGTERM (`lib/shutdown.js`): it stops taking new work, finishes what's in flight, and force-exits at 25s, inside Kubernetes' 30s grace period. Verified in Docker: a worker sent SIGTERM mid-delivery finished the delivery, recorded it in the ledger, and exited with code 0 after 3.2s.
 
 ## Tests
 

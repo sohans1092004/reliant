@@ -1,0 +1,34 @@
+# Local cluster (Docker Desktop Kubernetes, kind, minikube):
+#   docker build -t reliant:dev .
+#   cp k8s/local/secrets.env.example k8s/local/secrets.env   # then fill in real values
+#   kubectl apply -k k8s/local
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: reliant
+resources:
+  - namespace.yaml
+  - ../app
+  - infra.yaml
+
+images:
+  - name: reliant
+    newName: reliant
+    newTag: dev # built locally; Docker Desktop's cluster sees local images (kind: `kind load docker-image reliant:dev`)
+
+configMapGenerator:
+  - name: reliant-config
+    literals:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=reliant
+      - DB_NAME=reliant
+      - KAFKA_BROKER=redpanda:9092
+      - REDIS_URL=redis://redis:6379
+      - RETRY_FAST_MODE=false
+      # Dev only: lets test endpoints run inside the cluster (private IPs). Never in prod.
+      - ALLOW_PRIVATE_ENDPOINTS=true
+
+secretGenerator:
+  - name: reliant-secrets
+    envs:
+      - secrets.env # gitignored; copy secrets.env.example

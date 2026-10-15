@@ -6,12 +6,13 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { pool, newProducer, publishEvent, ensureTopics } from './lib/infra.js';
+import { pool, newProducer, publishEvent, ensureTopics, closeRedis } from './lib/infra.js';
 import { sendJson, readJson, bearer, safeEqual } from './lib/http.js';
 import { takeToken } from './lib/rate-limit.js';
 import { log } from './lib/log.js';
 import { metrics, serveMetrics } from './lib/metrics.js';
 import { initTracing, inSpan, currentTraceparent, SpanKind } from './lib/tracing.js';
+import { onShutdown } from './lib/shutdown.js';
 import { validateEvent } from './core/event.js';
 
 const PORT = Number(process.env.INGEST_PORT || 3000);
@@ -109,6 +110,15 @@ export const server = http.createServer(async (req, res) => {
 });
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Registered first, so a SIGTERM during startup isn't ignored. Stop accepting; requests
+  // already in flight finish both durability boundaries. (close() on a server that never
+  // started listening just calls back with an error - fine here.)
+  onShutdown(async () => {
+    await new Promise((resolve) => server.close(() => resolve()));
+    await producer.disconnect();
+    await closeRedis();
+    await pool.end();
+  });
   await ensureTopics();
   await producer.connect();
   initTracing('ingest');

@@ -6,6 +6,7 @@ import { nextRetryDelay } from './core/backoff.js';
 import { log } from './lib/log.js';
 import { metrics, serveMetrics, client } from './lib/metrics.js';
 import { initTracing, inSpan, fromTraceparent } from './lib/tracing.js';
+import { onShutdown } from './lib/shutdown.js';
 import { trace } from '@opentelemetry/api';
 
 const POLL_MS = Number(process.env.WORKER_POLL_MS || 10_000);
@@ -233,6 +234,17 @@ async function sweep() {
 }
 
 async function run() {
+  // Registered FIRST: a SIGTERM that lands during startup or the first sweep must not be
+  // ignored (Node as PID 1 drops unhandled SIGTERM - found by a mid-delivery shutdown test).
+  let timer;
+  onShutdown(async () => {
+    stopping = true; // stop claiming new work...
+    clearInterval(timer);
+    await currentSweep; // ...and let in-flight deliveries and their ledger writes finish
+    await dlqProducer.disconnect();
+    await closeRedis();
+    await pool.end();
+  });
   initTracing('worker');
   serveMetrics(9102);
   await dlqProducer.connect();
@@ -248,23 +260,8 @@ async function run() {
     isRunning = false;
   }
 
+  timer = setInterval(tick, POLL_MS);
   await tick();
-  const timer = setInterval(tick, POLL_MS);
-
-  // Graceful shutdown: finish in-flight deliveries (and their ledger writes) first.
-  for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.on(sig, async () => {
-      if (stopping) return;
-      stopping = true;
-      clearInterval(timer);
-      log.info('shutting down, finishing in-flight deliveries');
-      await currentSweep;
-      await dlqProducer.disconnect();
-      await closeRedis();
-      await pool.end();
-      process.exit(0);
-    });
-  }
 }
 
 run().catch((err) => {

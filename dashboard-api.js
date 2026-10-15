@@ -19,12 +19,13 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { pool, encryptSecret, retryPolicy } from './lib/infra.js';
+import { pool, encryptSecret, retryPolicy, closeRedis } from './lib/infra.js';
 import { getBreaker } from './lib/breaker.js';
 import { assertSafeUrl } from './lib/deliver.js';
 import { sendJson, readJson, bearer, sha256 } from './lib/http.js';
 import { log } from './lib/log.js';
 import { serveMetrics } from './lib/metrics.js';
+import { onShutdown } from './lib/shutdown.js';
 import { generateSecret } from './core/signing.js';
 import { validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './core/backoff.js';
 
@@ -245,6 +246,11 @@ export const server = http.createServer(async (req, res) => {
 });
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  onShutdown(async () => {
+    await new Promise((resolve) => server.close(() => resolve()));
+    await closeRedis();
+    await pool.end();
+  });
   serveMetrics(9103);
   server.listen(PORT, () => log.info('dashboard listening', { port: PORT }));
 }

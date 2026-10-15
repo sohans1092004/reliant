@@ -5,6 +5,7 @@ import { nextRetryDelay } from './core/backoff.js';
 import { log } from './lib/log.js';
 import { serveMetrics } from './lib/metrics.js';
 import { initTracing, inSpan, fromTraceparent } from './lib/tracing.js';
+import { onShutdown } from './lib/shutdown.js';
 
 const producer = newProducer();
 
@@ -54,27 +55,31 @@ async function retryStuckEvents() {
 }
 
 async function run() {
+  // Registered first, so a SIGTERM during startup or the first sweep isn't ignored.
+  let isRunning = false, stopping = false, current = Promise.resolve(), timer;
+  onShutdown(async () => {
+    stopping = true;
+    clearInterval(timer);
+    await current;
+    await producer.disconnect();
+    await pool.end();
+  });
   await ensureTopics();
   await producer.connect();
   initTracing('retry-publisher');
   serveMetrics(9104);
   log.info('retry publisher started', { poll_ms: 10000 });
 
-  let isRunning = false;
   async function tick() {
-    if (isRunning) return;
+    if (isRunning || stopping) return;
     isRunning = true;
-    try {
-      await retryStuckEvents();
-    } catch (err) {
-      log.error('retry sweep failed', { err });
-    } finally {
-      isRunning = false;
-    }
+    current = retryStuckEvents().catch((err) => log.error('retry sweep failed', { err }));
+    await current;
+    isRunning = false;
   }
 
+  timer = setInterval(tick, 10000);
   await tick();
-  setInterval(tick, 10000);
 }
 
 run();

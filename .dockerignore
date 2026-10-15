@@ -1,0 +1,14 @@
+# Keep secrets, local state and dev-only files out of the image (and the build context).
+.env
+.git
+.github
+node_modules
+archive
+graphify-out
+loadtest
+tests
+docs
+k8s
+observability
+*.docx
+*.md

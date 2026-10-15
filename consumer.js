@@ -7,6 +7,7 @@ import { validateEvent } from "./core/event.js";
 import { log } from "./lib/log.js";
 import { metrics, serveMetrics } from "./lib/metrics.js";
 import { initTracing, fromTraceparent } from "./lib/tracing.js";
+import { onShutdown } from "./lib/shutdown.js";
 import { context, trace } from "@opentelemetry/api";
 
 const outcomeLabel = (r) => (r.ok ? "delivered" : r.timedOut ? "timeout" : "failed");
@@ -194,21 +195,14 @@ async function run() {
   });
 }
 
-// Graceful shutdown (spec failure scenario #10): stop taking new messages and let
-// in-flight ones finish their ledger writes before exiting.
-let stopping = false;
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, async () => {
-    if (stopping) return;
-    stopping = true;
-    log.info("shutting down");
-    await consumer.disconnect();
-    await dlqProducer.disconnect();
-    await closeRedis();
-    await pool.end();
-    process.exit(0);
-  });
-}
+// disconnect() stops fetching and waits for the running eachBatch (and its ledger
+// writes and offset commits) to finish.
+onShutdown(async () => {
+  await consumer.disconnect();
+  await dlqProducer.disconnect();
+  await closeRedis();
+  await pool.end();
+});
 
 run().catch((err) => {
   log.error("consumer failed to start", { err });
