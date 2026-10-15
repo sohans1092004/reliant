@@ -1,0 +1,6 @@
+# Apply after k8s/local, once KEDA is installed:  kubectl apply -k k8s/local/autoscaling
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: reliant
+resources:
+  - scaledobjects.yaml

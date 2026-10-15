@@ -16,9 +16,12 @@ spec:
       containers:
         - name: postgres
           image: postgres:16
+          # Literal user/db, NOT the app ConfigMap: kustomize renames that ConfigMap whenever any
+          # app setting changes, which would restart (and, with emptyDir, wipe) the database.
+          # Keep these in sync with DB_USER / DB_NAME in kustomization.yaml.
           env:
-            - { name: POSTGRES_USER, valueFrom: { configMapKeyRef: { name: reliant-config, key: DB_USER } } }
-            - { name: POSTGRES_DB, valueFrom: { configMapKeyRef: { name: reliant-config, key: DB_NAME } } }
+            - { name: POSTGRES_USER, value: reliant }
+            - { name: POSTGRES_DB, value: reliant }
             - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: reliant-secrets, key: DB_PASSWORD } } }
           ports:
             - { containerPort: 5432 }
@@ -94,7 +97,9 @@ spec:
             - --overprovisioned
             - --node-id=0
             - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-            - --advertise-kafka-addr=PLAINTEXT://redpanda:9092 # the Service name, not localhost
+            # What clients are told to connect to after bootstrap: the Service's full name, so it
+            # resolves from any namespace (KEDA's Kafka scaler runs in "keda").
+            - --advertise-kafka-addr=PLAINTEXT://redpanda.reliant.svc.cluster.local:9092
           ports:
             - { containerPort: 9092 }
           readinessProbe:

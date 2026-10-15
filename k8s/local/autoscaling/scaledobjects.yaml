@@ -1,0 +1,57 @@
+# Autoscaling (ADR-006) with KEDA. Requires KEDA in the cluster:
+#   kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.21.0/keda-2.21.0.yaml
+# KEDA creates and drives an HPA for each target below.
+
+# Consumer: scale on Kafka consumer-group lag, read straight from the broker.
+# Capped at the partition count - a consumer beyond it would get no partition.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: consumer
+spec:
+  scaleTargetRef: { name: consumer }
+  minReplicaCount: 1
+  maxReplicaCount: 12 # = EVENT_PARTITIONS
+  # Scale up fast, scale down only after 2 quiet minutes (each consumer rebalance pauses delivery).
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServersFromEnv: KAFKA_BROKER # from the consumer pod's own config
+        consumerGroup: delivery-workers
+        topic: webhooks.events
+        lagThreshold: "500"  # target lag per consumer replica (~0.5s of one consumer's throughput)
+        allowIdleConsumers: "false"
+---
+# Worker: scale on how many endpoints have retry work due right now. One worker
+# handles one row per endpoint per sweep, so endpoints-with-due-work (not raw row
+# count) is the parallelism that more workers can actually use.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+spec:
+  scaleTargetRef: { name: worker }
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  # Scale up fast, scale down only after 2 quiet minutes (each consumer rebalance pauses delivery).
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120
+  triggers:
+    - type: postgresql
+      metadata:
+        host: postgres.reliant.svc.cluster.local # environment-specific; full name because KEDA runs in another namespace
+        port: "5432"
+        userName: reliant
+        dbName: reliant
+        sslmode: disable
+        passwordFromEnv: DB_PASSWORD # from the worker pod's Secret
+        query: "SELECT count(DISTINCT endpoint_id) FROM delivery_attempts WHERE status = 'pending' AND next_retry_at <= NOW()"
+        targetQueryValue: "50" # endpoints with due work per worker replica

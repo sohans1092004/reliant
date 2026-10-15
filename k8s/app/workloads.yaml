@@ -55,9 +55,9 @@ metadata:
   name: consumer
   labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: consumer }
 spec:
+  # No `replicas`: KEDA scales this on Kafka lag (k8s/local/autoscaling, ADR-006), and a
+  # fixed count here would be reset by every `kubectl apply`. Without KEDA it defaults to 1.
   # Useful up to the partition count (EVENT_PARTITIONS = 12); beyond that, consumers idle.
-  # Autoscaling on consumer lag is ADR-006 (not decided yet).
-  replicas: 1
   selector:
     matchLabels: { app.kubernetes.io/component: consumer }
   template:
@@ -101,7 +101,8 @@ metadata:
   name: worker
   labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: worker }
 spec:
-  replicas: 2 # row leases make any number of workers safe
+  # No `replicas`: KEDA scales this on due retry work (ADR-006); defaults to 1 without it.
+  # Row leases make any number of workers safe.
   selector:
     matchLabels: { app.kubernetes.io/component: worker }
   template:
@@ -226,7 +227,9 @@ spec:
             capabilities: { drop: ["ALL"] }
 ---
 # Schema + Kafka topics. Safe to re-run (migrate.js is idempotent). Retries while
-# Postgres/Kafka are still starting.
+# Postgres/Kafka are still starting. A Job's pod template can't be changed after
+# creation, so it deletes itself shortly after finishing: the next `kubectl apply`
+# then creates (and runs) it again instead of failing with "field is immutable".
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -234,7 +237,7 @@ metadata:
   labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: migrate }
 spec:
   backoffLimit: 10
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 30
   template:
     metadata:
       labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: migrate }

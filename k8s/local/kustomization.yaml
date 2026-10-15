@@ -18,12 +18,13 @@ images:
 configMapGenerator:
   - name: reliant-config
     literals:
-      - DB_HOST=postgres
+      # Fully qualified, so they also resolve from other namespaces (KEDA's scalers run in "keda").
+      - DB_HOST=postgres.reliant.svc.cluster.local
       - DB_PORT=5432
       - DB_USER=reliant
       - DB_NAME=reliant
-      - KAFKA_BROKER=redpanda:9092
-      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKER=redpanda.reliant.svc.cluster.local:9092
+      - REDIS_URL=redis://redis.reliant.svc.cluster.local:6379
       - RETRY_FAST_MODE=false
       # Dev only: lets test endpoints run inside the cluster (private IPs). Never in prod.
       - ALLOW_PRIVATE_ENDPOINTS=true

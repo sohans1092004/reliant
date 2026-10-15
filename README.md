@@ -32,10 +32,16 @@ docker run --rm reliant:dev node consumer.js        # any of the five processes
 cp k8s/local/secrets.env.example k8s/local/secrets.env   # fill in values
 kubectl apply -k k8s/local                                # app + in-cluster Postgres/Redis/Redpanda
 kubectl -n reliant port-forward svc/dashboard 3001       # http://localhost:3001
+
+# Autoscaling (ADR-006): install KEDA once, then
+kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.21.0/keda-2.21.0.yaml
+kubectl apply -k k8s/local/autoscaling                    # consumer on Kafka lag, worker on due retries
 ```
 
 - `k8s/app/`: Reliant itself, environment-agnostic. Five Deployments, ingest and dashboard Services, and a `migrate` Job that is safe to re-run. Every pod runs non-root with a read-only root filesystem, drops all capabilities, and has probes and resource requests.
-- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda with no persistence (dev only), plus config and secrets. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
+- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda, plus config and secrets. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
+  - **Dev only, no persistence:** restarting the Postgres or Redpanda pod wipes them. After that, run `kubectl -n reliant delete job migrate --ignore-not-found && kubectl apply -k k8s/local` to recreate the schema and topics. The migrate Job deletes itself 30s after finishing, so re-applying re-runs it.
+  - **Addresses are fully qualified** (`*.reliant.svc.cluster.local`), so KEDA's scalers in the `keda` namespace can reach them too.
 - Every process shuts down gracefully on SIGTERM (`lib/shutdown.js`): it stops taking new work, finishes what's in flight, and force-exits at 25s, inside Kubernetes' 30s grace period. Verified in Docker: a worker sent SIGTERM mid-delivery finished the delivery, recorded it in the ledger, and exited with code 0 after 3.2s.
 
 ## Tests
