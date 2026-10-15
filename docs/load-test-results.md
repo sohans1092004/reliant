@@ -11,8 +11,8 @@ Spec §14 and v2 §5, scaled to one machine. Harness: `loadtest/run.js` (`ingest
 | Spec target | Result | Verdict |
 |---|---|---|
 | Ingest 1,000 events/s baseline | ~950/s per process; 2 processes ~1,290/s; 4 processes ~1,930/s | **Met with 2+ processes** |
-| Healthy endpoints' p95 unaffected by a broken endpoint of the same tenant | Steady state: unaffected (36–65ms vs 33–52ms). **First ~20s: p95 5.1s** | **Not met:** a startup transient |
-| Recovery: drain at ~2,000 events/s | ~180 events/s average, ~340/s peak (one consumer, 3 partitions) | **Not met, ~10x short** |
+| Healthy endpoints' p95 unaffected by a broken endpoint of the same tenant | Steady state: unaffected. **First ~10s after an endpoint breaks: p95 up to 5.8s** (was ~20s before the batched consumer) | **Not met:** a startup transient, now half as long |
+| Recovery: drain at ~2,000 events/s | Batched consumer: ~800–960/s with 1 consumer, ~1,500–1,780/s peak with 3 (was ~180/s) | **Not met yet:** ~5x better, limited by consumer CPU and partition skew |
 
 ## 1. Ingest throughput
 
@@ -83,6 +83,44 @@ Ways to raise it, cheapest first:
 1. **More partitions and more consumer processes.** Throughput scales with partitions × consumers. The partition count is the cap, and it's fixed at 3 today (`EVENT_PARTITIONS`). Changing it on a live topic remaps tenants (ADR-004).
 2. **Fewer round trips per message:** combine the breaker read with the pending check, and write the breaker state only when it changes.
 3. **`eachBatch` instead of `eachMessage`:** process a batch with one multi-row ledger INSERT. That's the spec §10 group-commit advice, applied to the consumer.
+
+## 4. After batching the consumer (`eachBatch`)
+
+The consumer now works in chunks of up to 200 messages per partition, and does its bookkeeping once per chunk instead of once per message:
+- one query for the archive check, one for endpoints, one for pending rows
+- one Redis `MGET` for breaker states
+- one multi-row ledger `INSERT`, one multi-row queue `INSERT`
+- breaker writes only for states that changed
+
+Per-endpoint order is kept: each endpoint's events in a chunk are attempted one after another, and anything after a failure or an earlier pending row is queued behind it. A new **3-second budget per endpoint per chunk** stops a slow-but-working endpoint from holding a partition for N × timeout. Offsets are resolved per chunk, only after its writes succeed (ADR-005). Decrypted signing secrets are also cached by ciphertext, because decrypting them per event was measurable CPU.
+
+**Recovery** (backlog ~26k–36k events, 30 tenants, steady-state rate from 5-second windows):
+
+| Consumers | Steady drain rate | Note |
+|---|---|---|
+| 1, per-message (before) | ~110–340/s | |
+| 1, batched | **~800–960/s** | Repeatable over 3 runs. One run reached 2,200–2,570/s and could not be reproduced. |
+| 3, batched | **~1,480–1,780/s** at peak | Falls to ~700–870/s at the end, once the lighter partitions are done |
+
+One consumer now uses ~119% CPU while Docker (Postgres + Redis + Redpanda) uses ~18%, so **the consumer is CPU-bound**, not the database. Three consumers help only up to the partition count. The tail is **partition skew**: 30 tenants don't hash evenly onto 3 partitions, so at the end one consumer is left on the busiest partition. **Next lever: more partitions** (e.g. 12), which also means more consumers can be useful. Changing the count on a live topic remaps tenants (ADR-004), so do it at zero lag.
+
+**Isolation**, same setup as §2:
+
+| Run | p50 | p95 | p99 |
+|---|---|---|---|
+| Baseline | 25ms | 86ms | 162ms |
+| + 1 hanging endpoint per tenant | **35ms** (was 1,048ms) | 4,593ms | 5,785ms |
+
+```
+hanging:  0-5s 5830ms | 5-10s 1904ms | 10-15s 100ms | 15-20s 75ms | 20-25s 61ms | 25-30s 126ms
+```
+
+The transient now clears in ~10s instead of ~20s, and the median is unaffected. **What remains is structural:** kafkajs fetches a partition's next batch only after the current one returns, so the first 3-second inline timeout against a newly broken endpoint still delays everything behind it on that partition. Baseline p95 rose from 42ms to 86ms, because a chunk's events to one endpoint are now sent one after another.
+
+Ways to remove the remaining stall (an ADR-007 decision):
+1. **Shorter inline timeout** (e.g. 1s): one line, cuts the stall about 3x, and sends more slow-but-healthy deliveries to the worker.
+2. **Queue first, attempt in the background:** write the queue row, commit the offset, attempt outside the batch. No stall at all, but every delivery costs a write again (the Day 2 trade-off).
+3. **Pipeline batches:** keep fetching while attempts are in flight, and commit only up to the lowest finished offset. No stall and no extra writes, but the most complex option.
 
 ## Bugs found by load testing (all fixed)
 

@@ -8,7 +8,7 @@ A delivery attempt involves three steps that can each fail independently: the HT
 
 ## Decision
 
-The record comes first, then the commit. In `consumer.js`, all of a message's work happens inside `eachMessage`: the inline attempt, its `delivery_ledger` row (written by `lib/deliver.js`), and, on failure, its `delivery_attempts` row. kafkajs only treats an offset as done after `eachMessage` resolves. If any of those writes throws, `eachMessage` rejects and the message is redelivered.
+The record comes first, then the commit. `consumer.js` processes each Kafka batch in chunks of up to 200 messages (`eachBatch`, auto-resolve off). For each chunk it makes the inline attempts, then writes all their `delivery_ledger` rows and any `delivery_attempts` rows (one multi-row `INSERT` each), and **only then** calls `resolveOffset` for the chunk's last message. If a write throws, the chunk's offsets are never resolved and its messages are redelivered.
 
 **Even a clean inline success writes one ledger row.** This partly reverses the Day 2 decision to make healthy deliveries cost zero database writes. Without it, a successful delivery leaves no trace, which breaks the spec's core promise of an auditable history for every accepted event.
 
@@ -20,8 +20,8 @@ Suppose the order were reversed and the process crashed after a successful HTTP 
 
 ## Consequences
 
-- **The duplicate window is wider than "one message."** kafkajs doesn't commit after every message; it commits resolved offsets in batches. A crash can therefore redeliver every message processed since the last commit. For messages that ended up in the retry queue, the unique index on `delivery_attempts (event_id, endpoint_id)` with `ON CONFLICT DO NOTHING` makes a redelivery a no-op. **Messages that succeeded inline will be sent to the customer again.**
-- One extra Postgres write per delivery. At high throughput, ledger writes become the bottleneck before Kafka does. The spec's answer is batching (group commit), to be measured in the load tests.
+- **The duplicate window is one chunk (up to 200 messages) plus whatever has been resolved but not yet committed.** A crash redelivers all of those. For messages that ended up in the retry queue, the unique index on `delivery_attempts (event_id, endpoint_id)` with `ON CONFLICT DO NOTHING` makes a redelivery a no-op. **Messages that succeeded inline will be sent to the customer again.** Batching traded a wider duplicate window for ~5x the throughput (see `docs/load-test-results.md`).
+- One extra ledger row per delivery, written in one multi-row `INSERT` per chunk (group commit), so the consumer's database cost is per chunk, not per event.
 - If Postgres is down, the consumer stops making progress rather than delivering without a record. That is the intended trade: no delivery without a record.
 
 ## Alternatives considered

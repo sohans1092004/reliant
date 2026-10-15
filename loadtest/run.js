@@ -269,20 +269,21 @@ async function isolation() {
 
 async function recovery() {
   const RATE = Number(process.env.LT_RATE || 300), SECONDS = Number(process.env.LT_SECONDS || 60);
+  const CONSUMERS = Number(process.env.LT_CONSUMERS || 1); // > partition count (3) adds nothing
   const tenants = await setupTenants(30, ['/ok']);
   start('ingest', 'ingest-api.js');
   start('consumer', 'consumer.js');
   await waitFor(() => fetch(`${INGEST}/health`).then((r) => r.ok, () => false), 'ingest up');
   await warmUp(tenants);
 
-  console.log(`\nRecovery: consumer offline while ingesting ${RATE} events/s for ${SECONDS}s`);
+  console.log(`\nRecovery: consumer offline while ingesting ${RATE} events/s for ${SECONDS}s, then ${CONSUMERS} consumer(s)`);
   stop('consumer');
   const { sent, errors } = await openLoop(tenants, RATE, SECONDS);
   const backlog = await eventCount() - 1; // minus the warm-up event, whose ledger rows warmUp() deleted
   console.log(`backlog built: ${backlog} events (${sent} sent, ${errors} errors)`);
 
   const t0 = Date.now();
-  start('consumer', 'consumer.js');
+  for (let i = 0; i < CONSUMERS; i++) start(`consumer${i}`, 'consumer.js');
   let last = 0;
   const progress = setInterval(async () => {
     const d = await deliveredCount();
