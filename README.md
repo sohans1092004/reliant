@@ -92,11 +92,15 @@ Induced-failure postmortems: [`production/incident-reports/`](production/inciden
 
 ## Receiver contract
 
-Every request is a signed `POST` with `webhook-id` (= `event_id`), `webhook-timestamp` and `webhook-signature` (`v1,<base64 HMAC-SHA256 of id.timestamp.body>`; two signatures, space-separated, during a secret rotation). See `verify()` in `core/signing.js`. Receivers should:
+Every request is a signed `POST` with `webhook-id` (= `event_id`), `webhook-timestamp` and `webhook-signature` (`v1,<base64 HMAC-SHA256 of id.timestamp.body>`, keyed with the base64-decoded part of the `whsec_` secret; two signatures, space-separated, during a secret rotation). See `verify()` in `core/signing.js`. Receivers should:
 
 - return 2xx only once the event is handled; anything else is retried
 - deduplicate on `webhook-id`, because delivery is at-least-once
 - answer `type: "reliant.ping"` with 2xx and do nothing else; Reliant uses it to tell a broken endpoint from one bad event
+
+**Python receiver SDK** ([`sdk/python/`](sdk/python/README.md)): verifies signatures (both secrets during a rotation), rejects replays, skips `reliant.ping`, and dedups on `webhook-id`. Standard library only. Its tests sign with `core/signing.js`, so they catch any drift between SDK and server.
+
+**Standard Webhooks compatible:** Reliant signs exactly as [Standard Webhooks](https://www.standardwebhooks.com/) specifies (same headers; the HMAC key is the base64-decoded part after `whsec_`), so receivers can use its official libraries in any language. Checked against the published test vector (`core/core.test.js`) and, in CI, against the official Python library in both directions.
 
 ## Where this deviates from the spec
 

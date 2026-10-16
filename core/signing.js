@@ -1,18 +1,28 @@
 // Pure HMAC signing/verification + secret encryption at rest. Node's crypto only.
 //
-// Headers sent with every delivery (Standard Webhooks style):
+// Compatible with Standard Webhooks (standardwebhooks.com): receivers can verify with
+// its official libraries. Headers sent with every delivery:
 //   webhook-id:        event_id (doubles as the nonce - receivers dedupe on it)
 //   webhook-timestamp: unix seconds
 //   webhook-signature: "v1,<base64 hmac>" - space-separated, one per active secret
 // The signed content is `${id}.${timestamp}.${body}`, so changing any of the three breaks it.
+// The HMAC key is the base64-decoded part of the secret after "whsec_" (32 random bytes).
 import crypto from 'node:crypto';
 
 export const ROTATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export const generateSecret = () => 'whsec_' + crypto.randomBytes(32).toString('base64');
 
+// Strict: Node's base64 decoder skips characters it doesn't know, so without the check
+// two different malformed secrets could silently decode to the same key.
+function signingKey(secret) {
+  const b64 = secret.startsWith('whsec_') ? secret.slice('whsec_'.length) : secret;
+  if (!b64 || b64.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) throw new Error('signing secret must be whsec_<base64>');
+  return Buffer.from(b64, 'base64');
+}
+
 export function sign(secret, id, timestamp, body) {
-  return 'v1,' + crypto.createHmac('sha256', secret).update(`${id}.${timestamp}.${body}`).digest('base64');
+  return 'v1,' + crypto.createHmac('sha256', signingKey(secret)).update(`${id}.${timestamp}.${body}`).digest('base64');
 }
 
 // During a rotation window we sign with BOTH secrets, so a receiver still holding

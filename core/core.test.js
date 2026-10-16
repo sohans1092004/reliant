@@ -78,12 +78,22 @@ test('signing: valid signature verifies; tampering, wrong secret, stale timestam
 });
 
 test('signing: rotation window signs with both secrets, then only the new one', () => {
-  const ep = { secret: 'new', secretPrevious: 'old', rotatedAt: new Date(0) };
-  assert.deepEqual(sig.activeSecrets(ep, 1000), ['new', 'old']);
-  assert.deepEqual(sig.activeSecrets(ep, sig.ROTATION_WINDOW_MS), ['new']);
+  const [newSecret, oldSecret] = [sig.generateSecret(), sig.generateSecret()];
+  const ep = { secret: newSecret, secretPrevious: oldSecret, rotatedAt: new Date(0) };
+  assert.deepEqual(sig.activeSecrets(ep, 1000), [newSecret, oldSecret]);
+  assert.deepEqual(sig.activeSecrets(ep, sig.ROTATION_WINDOW_MS), [newSecret]);
   const h = sig.signatureHeader(sig.activeSecrets(ep, 1000), 'e', 5, 'b');
-  assert.ok(sig.verify(['old'], 'e', 5, 'b', h, 5), 'receiver still on old secret');
-  assert.ok(sig.verify(['new'], 'e', 5, 'b', h, 5), 'receiver already on new secret');
+  assert.ok(sig.verify([oldSecret], 'e', 5, 'b', h, 5), 'receiver still on old secret');
+  assert.ok(sig.verify([newSecret], 'e', 5, 'b', h, 5), 'receiver already on new secret');
+});
+
+// The published Standard Webhooks test vector: matching it means receivers can verify
+// with the official libraries (sdk/python also checks against the library itself).
+test('signing: matches the Standard Webhooks test vector; rejects malformed secrets', () => {
+  const body = '{"test": 2432232314}';
+  assert.equal(sig.sign('whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw', 'msg_p5jXN8AQM9LWM0D4loKWxJek', 1614265330, body),
+    'v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=');
+  for (const bad of ['whsec_', 'whsec_not base64!', 'whsec_abc']) assert.throws(() => sig.sign(bad, 'e', 1, 'b'), /whsec_<base64>/, bad);
 });
 
 test('signing: encrypt/decrypt round-trip, tamper detected', () => {

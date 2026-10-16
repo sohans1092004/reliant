@@ -25,6 +25,23 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  python-sdk:
+    name: Python receiver SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9" # the oldest version pyproject.toml claims
+      - uses: actions/setup-node@v4 # the cross-language tests sign with core/signing.js
+        with:
+          node-version: 22
+      # The official Standard Webhooks library, to prove Reliant's signatures verify with it.
+      - run: pip install standardwebhooks==1.1.0
+      - run: python -m unittest discover -s tests -v
+        working-directory: sdk/python
+
   integration:
     name: Integration tests (Postgres + Redis + Redpanda)
     needs: unit

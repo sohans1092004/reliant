@@ -3,3 +3,5 @@ node_modules/
 graphify-out/
 archive/
 k8s/local/secrets.env
+__pycache__/
+*.egg-info/
