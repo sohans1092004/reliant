@@ -21,6 +21,23 @@ groups:
         annotations:
           summary: "{{ $value | humanizePercentage }} of ingest requests are failing (5xx)"
 
+      # Durable accountability, checked at runtime: accepted events with no attempt and no
+      # queued delivery 15+ minutes later. The reconciler (retry-publisher.js) re-sends them
+      # once the consumer is caught up, so this firing means it can't or it keeps recurring.
+      - alert: ReliantUnaccountedEvents
+        expr: max(reliant_unaccounted_events) > 0
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value }} accepted events have no delivery outcome"
+          description: "Check consumer lag first (the reconciler waits for it), then the retry-publisher logs. Any recurrence means the durability chain broke somewhere (ADR-001/005)."
+
+      - alert: ReliantLeaseLost
+        expr: sum(increase(reliant_lease_lost_total[15m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "A delivery worker held a row past its 60s lease; the endpoint may have received a duplicate"
+
       - alert: ReliantDLQDepthHigh
         expr: sum(reliant_dlq_depth) > 1000
         for: 10m

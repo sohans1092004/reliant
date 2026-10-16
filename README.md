@@ -13,7 +13,7 @@ npm run migrate               # schema + Kafka topics (12 partitions; grows only
 npm run ingest                # :3000  POST /events
 npm run consumer              # Kafka -> inline delivery attempt
 npm run worker                # retries, run as many as you like
-npm run retry-publisher       # re-publishes events whose Kafka publish failed
+npm run retry-publisher       # re-publishes events whose Kafka publish failed; reconciler (below)
 npm run dashboard             # :3001  UI + API, dev keys: dev_key_tenant_a / dev_key_tenant_b
 
 node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for the slow one)
@@ -39,7 +39,7 @@ kubectl apply -k k8s/local/autoscaling                    # consumer on Kafka la
 ```
 
 - `k8s/app/`: Reliant itself, environment-agnostic. Five Deployments, ingest and dashboard Services, and a `migrate` Job that is safe to re-run. Every pod runs non-root with a read-only root filesystem, drops all capabilities, and has probes and resource requests.
-- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda, plus config and secrets. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
+- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda, plus config and secrets. `redpanda-bootstrap.yaml` (also used by docker compose) turns Redpanda's write caching off, so a Kafka ack means the event is on disk, and turns off two Enterprise-licensed features the image enables by default. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
   - **Dev only, no persistence:** restarting the Postgres or Redpanda pod wipes them. After that, run `kubectl -n reliant delete job migrate --ignore-not-found && kubectl apply -k k8s/local` to recreate the schema and topics. The migrate Job deletes itself 30s after finishing, so re-applying re-runs it.
   - **Addresses are fully qualified** (`*.reliant.svc.cluster.local`), so KEDA's scalers in the `keda` namespace can reach them too.
 - Every process shuts down gracefully on SIGTERM (`lib/shutdown.js`): it stops taking new work, finishes what's in flight, and force-exits at 25s, inside Kubernetes' 30s grace period. Verified in Docker: a worker sent SIGTERM mid-delivery finished the delivery, recorded it in the ledger, and exited with code 0 after 3.2s.
@@ -67,7 +67,8 @@ Induced-failure postmortems: [`production/incident-reports/`](production/inciden
 - **Logs:** one JSON object per line (`lib/log.js`), carrying `event_id` / `endpoint_id` / `tenant_id` wherever they're known.
 - **Traces (OpenTelemetry):** set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` and each event gets one trace across processes: `ingest` → `kafka.publish` → `webhook.post` (consumer) → `deliver.retry` / `webhook.post` / `ledger.write` (worker, even hours later). The context travels in Kafka headers and in `events.traceparent`. With the variable unset, tracing is off and costs nothing.
 - **Stack:** `docker compose --profile observability up -d` starts Prometheus (http://localhost:9090, alert rules in `observability/alerts.yml`), Jaeger (http://localhost:16686) and Grafana (http://localhost:3002, with the provisioned *Reliant overview* dashboard and Jaeger in Explore). The profile is opt-in, so plain `docker compose up` and CI are unaffected.
-- **Alerts:** DLQ depth and growth, consumer lag growing, p95 latency above 5s, retry queue stuck, a breaker open for more than 30 minutes (per endpoint), per-tenant success rate, and a process down.
+- **Alerts:** accepted events with no outcome after 15 minutes, a worker losing its lease, DLQ depth and growth, consumer lag growing, p95 latency above 5s, retry queue stuck, a breaker open for more than 30 minutes (per endpoint), per-tenant success rate, ingest 5xx, and a process down.
+- **Reconciler** (in `retry-publisher.js`, every 5 min): finds events accepted 15–60 minutes ago that have a subscribed endpoint but no ledger row and no queued delivery, which ADR-005 says can't happen. It exports `reliant_unaccounted_events` and, once the consumer group's lag is under 1,000, sends them back to Kafka. During a backlog it only reports, since those events are usually still waiting in Kafka.
 
 **CI** (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request. Core unit tests run first, as a fast gate. If they pass, the integration tests run against the same `docker-compose.yml` stack, with test-only secrets generated fresh for each run. Load tests are not part of CI.
 

@@ -29,6 +29,8 @@ services:
       - --node-id 0
       - --kafka-addr PLAINTEXT://0.0.0.0:9092
       - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    volumes:
+      - ./k8s/local/redpanda-bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
     ports:
       - "9092:9092"
 

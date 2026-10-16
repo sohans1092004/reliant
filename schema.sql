@@ -77,6 +77,12 @@ ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS dead_reason       TEXT;  
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS terminal_at       TIMESTAMPTZ;
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS locked_until      TIMESTAMPTZ;  -- worker lease
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS processing_errors INT NOT NULL DEFAULT 0;
+-- Fencing token, new on every claim. A worker writes its outcome only while the row still
+-- carries its token, so a worker that stalled past its lease can't overwrite the new owner's.
+ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS lease UUID;
+-- The retry-publisher's sweep (Kafka publish failed) and the reconciler's age window.
+CREATE INDEX IF NOT EXISTS events_publish_pending ON events (next_retry_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS events_created ON events (created_at);
 -- One row per pair: lets replay be an upsert and makes a redelivered Kafka message a no-op.
 CREATE UNIQUE INDEX IF NOT EXISTS delivery_attempts_pair ON delivery_attempts (event_id, endpoint_id);
 -- Backs the worker's "oldest pending row per endpoint" query.

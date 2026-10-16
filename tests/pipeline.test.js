@@ -12,11 +12,12 @@ import { Partitioners } from 'kafkajs';
 import { pool, redis, closeRedis, kafka, TOPICS } from '../lib/infra.js';
 import { sha256 } from '../lib/http.js';
 import { verify } from '../core/signing.js';
+import { findUnaccounted } from '../retry-publisher.js';
 
 const INGEST = 'http://localhost:3100';
 // Off the defaults (9100-9102) so the test can't collide with locally running services.
 const METRICS_PORTS = { 'ingest-api.js': 9190, 'consumer.js': 9191, 'delivery-worker.js': 9192 };
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd', 'pipe_lease', 'pipe_lost'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
@@ -24,6 +25,7 @@ const received = [];     // { path, eventId, type, verified, status }
 const stdout = {};       // file -> everything the child printed
 const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true };
 const herd = { inflight: 0, max: 0 }; // concurrent requests at /herd
+const lease = { gate: null, arrived: null }; // /lease holds its response until the test says so
 const children = [];
 let receiver, dashboardBase, env;
 
@@ -85,6 +87,7 @@ before(async () => {
     if (path === '/picky' && event.payload.bad && behaviour.pickyRejectsBad) status = 422; // rejects one kind of event, accepts the rest
     if (path === '/burst' && behaviour.burstFailuresLeft > 0) { behaviour.burstFailuresLeft--; status = 503; }
     if (path === '/never') status = 500;
+    if (path === '/lease') { lease.arrived?.(); await lease.gate; }
     if (path === '/herd') { // a just-recovered endpoint: count how many requests overlap
       herd.max = Math.max(herd.max, ++herd.inflight);
       await sleep(30);
@@ -97,7 +100,7 @@ before(async () => {
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd'], ['pipe_lease', '/lease'], ['pipe_lost', '/lost']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -294,6 +297,45 @@ test('thundering herd: a recovered endpoint with a 40-event backlog gets one req
   assert.equal(herd.max, 1, `${herd.max} requests hit the recovering endpoint at once`);
   assert.deepEqual(received.filter((r) => r.path === '/herd').map((r) => r.eventId), ids, 'not delivered in order');
   assert.equal(JSON.parse(await (await redis()).get(`cb:${endpoints.pipe_herd}`)).state, 'closed');
+});
+
+// A worker that stalls past its 60s lease (GC pause, Postgres stall) while another worker
+// re-claims the row must not overwrite the new owner's state when it finally returns.
+test('lease fencing: a worker that lost its lease leaves the row to the new owner', async () => {
+  let release;
+  lease.gate = new Promise((r) => { release = r; });
+  const arrived = new Promise((r) => { lease.arrived = r; });
+  const id = crypto.randomUUID();
+  await pool.query(`INSERT INTO events (event_id, tenant_id, type, payload, created_at) VALUES ($1, 'pipe_lease', 'order.created', '{}', NOW())`, [id]);
+  await pool.query(`INSERT INTO delivery_attempts (event_id, endpoint_id, attempt_count, next_retry_at) VALUES ($1, $2, 1, NOW())`, [id, endpoints.pipe_lease]);
+  await arrived; // the worker's POST is in flight
+  // Its lease runs out and another worker claims the row: a new token.
+  await pool.query('UPDATE delivery_attempts SET lease = gen_random_uuid() WHERE event_id = $1', [id]);
+  release(); // the endpoint answers 200 to the stale worker
+  await waitFor(() => stdout['delivery-worker.js'].includes('lease lost'), 'lease-lost log');
+  const { rows: [row] } = await pool.query('SELECT status, attempt_count FROM delivery_attempts WHERE event_id = $1', [id]);
+  assert.deepEqual([row.status, row.attempt_count], ['pending', 1], 'stale worker overwrote the row');
+  const { rows: ledger } = await pool.query('SELECT status FROM delivery_ledger WHERE event_id = $1', [id]);
+  assert.deepEqual(ledger.map((r) => r.status), ['delivered'], 'the attempt itself must stay on record');
+});
+
+test('reconciler: finds accepted events with no outcome, and only those', async () => {
+  // Endpoint subscribed long before; three events from 20 minutes ago.
+  await pool.query(`UPDATE endpoints SET created_at = NOW() - INTERVAL '2 hours' WHERE tenant_id = 'pipe_lost'`);
+  const [lost, delivered, queued] = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+  await pool.query(
+    `INSERT INTO events (event_id, tenant_id, type, payload, created_at, status, published_to_kafka)
+     SELECT id, 'pipe_lost', 'order.created', '{}', NOW() - INTERVAL '20 minutes', 'delivered', TRUE FROM unnest($1::uuid[]) AS id`,
+    [[lost, delivered, queued]]);
+  await pool.query(
+    `INSERT INTO delivery_ledger (event_id, endpoint_id, tenant_id, attempt_number, status, attempted_at)
+     VALUES ($1, $2, 'pipe_lost', 1, 'delivered', NOW() - INTERVAL '20 minutes')`, [delivered, endpoints.pipe_lost]);
+  await pool.query('INSERT INTO delivery_attempts (event_id, endpoint_id, attempt_count) VALUES ($1, $2, 1)', [queued, endpoints.pipe_lost]);
+
+  const found = await findUnaccounted();
+  assert.ok(found.includes(lost), 'event with no attempt and no queued delivery not reported');
+  assert.ok(!found.includes(delivered) && !found.includes(queued), 'accounted-for event reported');
+  assert.ok(!(await findUnaccounted(25)).includes(lost), 'event younger than the threshold reported');
 });
 
 test('metrics: each process exposes what the tests above did', async () => {

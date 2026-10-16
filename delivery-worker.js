@@ -98,13 +98,13 @@ async function claimDueDeliveries() {
        SELECT id, row_number() OVER (PARTITION BY tenant_id ORDER BY next_retry_at) AS rn
        FROM heads WHERE next_retry_at <= NOW()
      ), claimed AS (
-       UPDATE delivery_attempts da SET locked_until = NOW() + ($1 * INTERVAL '1 second')
+       UPDATE delivery_attempts da SET locked_until = NOW() + ($1 * INTERVAL '1 second'), lease = gen_random_uuid()
        FROM due
        WHERE da.id = due.id AND due.rn <= $2
          AND da.status = 'pending' AND (da.locked_until IS NULL OR da.locked_until < NOW())
        RETURNING da.*
      )
-     SELECT c.id, c.event_id, c.endpoint_id, c.attempt_count, c.processing_errors,
+     SELECT c.id, c.lease, c.event_id, c.endpoint_id, c.attempt_count, c.processing_errors,
             e.tenant_id, e.type, e.payload, e.created_at, e.traceparent,
             ep.url, ep.secret_encrypted, ep.secret_previous_encrypted, ep.secret_rotated_at, t.retry_schedule_minutes
      FROM claimed c
@@ -116,13 +116,25 @@ async function claimDueDeliveries() {
   return rows;
 }
 
+// Every write to a claimed row is fenced on its lease token ($1 = id, $2 = lease). If this
+// worker stalled past LEASE_SECONDS (a long GC pause, a Postgres stall) and another worker
+// re-claimed the row, our outcome is dropped instead of overwriting the new owner's state.
+// It can't un-send our POST: that duplicate is what webhook-id is for. Our ledger row stays,
+// because the attempt did happen.
+async function updateLeased(attempt, set, params = []) {
+  const { rowCount } = await pool.query(`UPDATE delivery_attempts SET ${set} WHERE id = $1 AND lease = $2`,
+    [attempt.id, attempt.lease, ...params]);
+  if (!rowCount) {
+    metrics.leaseLost.inc();
+    log.warn('lease lost: another worker owns this row now, outcome not recorded on it',
+      { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id });
+  }
+  return rowCount > 0;
+}
+
 async function deadLetter(attempt, reason, error) {
-  await pool.query(
-    `UPDATE delivery_attempts
-     SET status = 'dead', dead_reason = $2, last_error = $3, terminal_at = NOW(), locked_until = NULL
-     WHERE id = $1`,
-    [attempt.id, reason, error],
-  );
+  if (!await updateLeased(attempt,
+    `status = 'dead', dead_reason = $3, last_error = $4, terminal_at = NOW(), locked_until = NULL`, [reason, error])) return;
   // Postgres is the source of truth; the topic is just a fan-out for alerting tools.
   await dlqProducer.send({
     topic: TOPICS.dlq,
@@ -142,10 +154,7 @@ async function processOneDelivery(attempt) {
   // sweep (DISTINCT ON), which is what stops a thundering herd on recovery.
   const breaker = await getBreaker(attempt.endpoint_id).catch(() => initialState());
   if (breaker.state === 'open') {
-    await pool.query(
-      `UPDATE delivery_attempts SET next_retry_at = $2, locked_until = NULL WHERE id = $1`,
-      [attempt.id, reopensAt(breaker)],
-    );
+    await updateLeased(attempt, `next_retry_at = $3, locked_until = NULL`, [reopensAt(breaker)]);
     log.info('circuit open, deferred', { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, until: reopensAt(breaker) });
     return;
   }
@@ -161,12 +170,9 @@ async function processOneDelivery(attempt) {
   metrics.attemptNumber.observe(attemptNumber);
 
   if (result.ok) {
-    await pool.query(
-      `UPDATE delivery_attempts
-       SET status = 'delivered', attempt_count = $2, last_http_status = $3, last_error = NULL, terminal_at = NOW(), locked_until = NULL
-       WHERE id = $1`,
-      [attempt.id, attemptNumber, result.httpStatus],
-    );
+    if (!await updateLeased(attempt,
+      `status = 'delivered', attempt_count = $3, last_http_status = $4, last_error = NULL, terminal_at = NOW(), locked_until = NULL`,
+      [attemptNumber, result.httpStatus])) return;
     log.info('delivered', { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id, attempt: attemptNumber, http_status: result.httpStatus });
     return;
   }
@@ -185,19 +191,14 @@ async function processOneDelivery(attempt) {
 
   const delayMs = nextRetryDelay(attemptNumber, retryPolicyFor(attempt.retry_schedule_minutes));
   if (endpointHealthy || delayMs === null) {
-    await pool.query(`UPDATE delivery_attempts SET attempt_count = $2, last_http_status = $3 WHERE id = $1`,
-      [attempt.id, attemptNumber, result.httpStatus]);
+    if (!await updateLeased(attempt, `attempt_count = $3, last_http_status = $4`, [attemptNumber, result.httpStatus])) return;
     await deadLetter(attempt, endpointHealthy ? 'payload_rejected' : 'delivery_exhausted',
       endpointHealthy ? `${result.error} (endpoint answered a ping fine, so this event is the problem)` : result.error);
     return;
   }
-  await pool.query(
-    `UPDATE delivery_attempts
-     SET attempt_count = $2, next_retry_at = NOW() + ($3 * INTERVAL '1 millisecond'),
-         last_error = $4, last_http_status = $5, locked_until = NULL
-     WHERE id = $1`,
-    [attempt.id, attemptNumber, delayMs, result.error, result.httpStatus],
-  );
+  if (!await updateLeased(attempt,
+    `attempt_count = $3, next_retry_at = NOW() + ($4 * INTERVAL '1 millisecond'), last_error = $5, last_http_status = $6, locked_until = NULL`,
+    [attemptNumber, delayMs, result.error, result.httpStatus])) return;
   log.info('still failing', { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, attempt: attemptNumber,
     error: result.error, next_retry_in_s: Math.round(delayMs / 1000) });
 }
@@ -215,9 +216,9 @@ async function processSafely(attempt) {
   } catch (err) {
     log.error('processing error', { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, err });
     const errors = attempt.processing_errors + 1;
-    await pool.query(`UPDATE delivery_attempts SET processing_errors = $2, locked_until = NULL WHERE id = $1`, [attempt.id, errors])
-      .catch(() => {}); // if even this fails, the lease expires and the row is retried
-    if (errors >= MAX_PROCESSING_ERRORS) await deadLetter(attempt, 'processing_error', err.message).catch(() => {});
+    const owned = await updateLeased(attempt, `processing_errors = $3, locked_until = NULL`, [errors])
+      .catch(() => false); // if even this fails, the lease expires and the row is retried
+    if (owned && errors >= MAX_PROCESSING_ERRORS) await deadLetter(attempt, 'processing_error', err.message).catch(() => {});
   }
 }
 

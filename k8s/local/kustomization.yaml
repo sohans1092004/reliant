@@ -43,6 +43,9 @@ configMapGenerator:
       - RETRY_FAST_MODE=false
       # Dev only: lets test endpoints run inside the cluster (private IPs). Never in prod.
       - ALLOW_PRIVATE_ENDPOINTS=true
+  - name: redpanda-bootstrap
+    files:
+      - redpanda-bootstrap.yaml
 
 secretGenerator:
   - name: reliant-secrets

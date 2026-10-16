@@ -1,0 +1,12 @@
+# Redpanda cluster config, read once when the cluster first forms (.bootstrap.yaml).
+# Used by docker-compose.yml and the k8s/local Redpanda Deployment.
+
+# Write caching acks a produce before it reaches disk. A broker crash could then lose an
+# event that ingest already marked published, and nothing would re-send it. Off: an ack
+# means the event is on disk. (A single broker still has no replica to fail over to.)
+write_caching_default: "false"
+
+# The image defaults turn on two Enterprise features that need a license. These are the
+# open-source settings.
+partition_autobalancing_mode: node_add
+core_balancing_continuous: false

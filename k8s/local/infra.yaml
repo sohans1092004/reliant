@@ -105,6 +105,11 @@ spec:
           readinessProbe:
             tcpSocket: { port: 9092 }
             periodSeconds: 5
+          volumeMounts:
+            - { name: bootstrap, mountPath: /etc/redpanda/.bootstrap.yaml, subPath: redpanda-bootstrap.yaml, readOnly: true }
+      volumes:
+        - name: bootstrap
+          configMap: { name: redpanda-bootstrap }
 ---
 apiVersion: v1
 kind: Service
