@@ -1,0 +1,16 @@
+# No VM? Run the stack on any machine with Docker and reach it through a free Cloudflare
+# quick tunnel: a public https://<random>.trycloudflare.com address, no account, no open ports.
+#   DOMAIN=:80 in deploy/.env (the tunnel does the TLS), then
+#   docker compose -f compose.yaml -f compose.tunnel.yaml up -d --build --wait
+#   docker compose -f compose.yaml -f compose.tunnel.yaml logs tunnel | grep trycloudflare.com
+# Live only while this machine is on; the address changes whenever the tunnel restarts.
+# Cloudflare offers quick tunnels for testing, without an uptime guarantee.
+services:
+  caddy:
+    ports: !reset [] # nothing listens on the host: the tunnel is the only way in
+
+  tunnel:
+    image: cloudflare/cloudflared:2024.8.2
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "--url", "http://caddy:80"]
+    depends_on: [caddy]

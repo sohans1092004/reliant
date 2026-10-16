@@ -44,6 +44,25 @@ Open `https://$DOMAIN`, sign in, and change the password.
 
 Deliveries to the demo receiver go out through the VM's public address and back in through Caddy, like any customer endpoint. If your provider doesn't route a VM's traffic back to its own public IP ("hairpin"), the delivery times out. Run the receiver on another machine instead.
 
+## No VM? A Cloudflare quick tunnel
+
+Any machine with Docker can be the host, with no domain, no open ports and no account. `compose.tunnel.yaml` removes Caddy's ports and adds a `cloudflared` container that gives the stack a public `https://<random>.trycloudflare.com` address.
+
+```bash
+cd deploy && cp .env.example .env    # fill the secrets as above, and set DOMAIN=:80 (the tunnel does TLS)
+docker compose -f compose.yaml -f compose.tunnel.yaml up -d --build --wait
+docker compose -f compose.yaml -f compose.tunnel.yaml logs tunnel | grep trycloudflare.com
+```
+
+Then follow steps 4 and 5 above, with the tunnel address in place of `$DOMAIN` and `-f compose.yaml -f compose.tunnel.yaml` on each command.
+
+Limits:
+- It's live only while that machine is on.
+- The address changes whenever the tunnel container restarts.
+- Cloudflare offers quick tunnels for testing, with no uptime guarantee.
+
+Caddy takes the visitor's IP from Cloudflare's `Cf-Connecting-IP` header, but only for requests from a private address (the tunnel container). So per-IP login limits still see real visitors, and a direct client on a VM can't fake the header.
+
 ## What's exposed, and what isn't
 
 | Path | Goes to | Who uses it |

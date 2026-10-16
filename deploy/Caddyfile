@@ -1,5 +1,20 @@
 # HTTPS for Reliant. Caddy gets and renews a Let's Encrypt certificate for $DOMAIN by itself
-# (ports 80 and 443 must reach this VM). DOMAIN=localhost gives a local self-signed one.
+# (ports 80 and 443 must reach this VM). DOMAIN=localhost gives a local self-signed one;
+# DOMAIN=:80 serves plain HTTP behind a tunnel that does the TLS (compose.tunnel.yaml).
+{
+	servers {
+		# The visitor's real IP, for the per-IP login limit. Taken from these headers only when
+		# the request comes from a private address (the tunnel container); a visitor connecting
+		# directly, as on a VM, can't set it.
+		trusted_proxies static private_ranges
+		client_ip_headers Cf-Connecting-IP X-Forwarded-For
+	}
+}
+
+(proxy_headers) {
+	# One entry: the client IP Caddy settled on above. The app reads the last entry (TRUST_PROXY).
+	header_up X-Forwarded-For {client_ip}
+}
 
 {$DOMAIN} {
 	encode gzip
@@ -13,16 +28,22 @@
 
 	# Producers: POST /events with the INGEST_TOKEN.
 	handle /events {
-		reverse_proxy ingest:3000
+		reverse_proxy ingest:3000 {
+			import proxy_headers
+		}
 	}
 
 	# The demo receiver (compose profile "demo"). Register https://$DOMAIN/demo-receiver/webhooks.
 	handle_path /demo-receiver/* {
-		reverse_proxy receiver:8080
+		reverse_proxy receiver:8080 {
+			import proxy_headers
+		}
 	}
 
 	# Everything else: the dashboard and its API.
 	handle {
-		reverse_proxy dashboard:3001
+		reverse_proxy dashboard:3001 {
+			import proxy_headers
+		}
 	}
 }
