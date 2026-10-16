@@ -15,9 +15,9 @@
   table { border-collapse:collapse; width:100%; } th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:500; font-size:12px; }
   code { font-size:12px; word-break:break-all; }
-  input { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:0; }
+  input, select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:0; }
   button { font:inherit; padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
-  button:hover { border-color:var(--accent); } button:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  button:hover { border-color:var(--accent); } button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .grow { flex:1; }
   .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .muted { color:var(--muted); }
@@ -30,10 +30,22 @@
   <h1>Reliant: webhook deliveries</h1>
 
   <section>
-    <form id="login" class="row">
-      <label for="key">Tenant API key</label>
-      <input id="key" class="grow" type="password" autocomplete="off" placeholder="dev_key_tenant_a">
-      <button>Load</button>
+    <form id="login" class="row" hidden>
+      <label for="email">Email</label>
+      <input id="email" class="grow" type="email" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" class="grow" type="password" autocomplete="current-password" required>
+      <button>Sign in</button>
+    </form>
+    <div id="whoami" class="row" hidden>
+      <span class="grow">Signed in as <strong id="meEmail"></strong> (<span id="meRole"></span>, tenant <code id="meTenant"></code>)</span>
+      <button type="button" id="showPassword">Change password</button>
+      <button type="button" id="logout">Sign out</button>
+    </div>
+    <form id="passwordForm" class="row" style="margin-top:12px" hidden>
+      <input id="currentPassword" class="grow" type="password" autocomplete="current-password" placeholder="Current password" aria-label="Current password" required>
+      <input id="newPassword" class="grow" type="password" autocomplete="new-password" minlength="12" placeholder="New password (12+ characters)" aria-label="New password" required>
+      <button>Save password</button>
     </form>
     <p id="status" class="muted" role="status"></p>
   </section>
@@ -42,7 +54,7 @@
     <h2>Endpoints</h2>
     <section>
       <table><thead><tr><th>URL</th><th>Event types</th><th>Active</th><th>Circuit</th><th></th></tr></thead><tbody id="endpoints"></tbody></table>
-      <form id="create" class="row" style="margin-top:12px">
+      <form id="create" class="row owner-only" style="margin-top:12px">
         <input id="newUrl" class="grow" type="url" required placeholder="https://example.com/webhooks" aria-label="New endpoint URL">
         <input id="newTypes" placeholder="event types, comma-separated (empty = all)" aria-label="Event types for the new endpoint">
         <button>Add endpoint</button>
@@ -61,8 +73,8 @@
       <form id="settings" class="row">
         <label for="schedule">Minutes between retries</label>
         <input id="schedule" class="grow" placeholder="e.g. 1, 5, 30" aria-describedby="scheduleHint">
-        <button>Save</button>
-        <button type="button" id="resetSchedule">Use default</button>
+        <button class="owner-only">Save</button>
+        <button type="button" id="resetSchedule" class="owner-only">Use default</button>
       </form>
       <p id="scheduleHint" class="muted"></p>
     </section>
@@ -72,26 +84,43 @@
       <p id="dlqEmpty" class="muted">Nothing here.</p>
       <table hidden id="dlqTable"><thead><tr><th>When</th><th>Event</th><th>Endpoint</th><th>Reason</th><th>Last error</th><th></th></tr></thead><tbody id="dlq"></tbody></table>
     </section>
+
+    <div class="owner-only">
+      <h2>Users</h2>
+      <section>
+        <table><thead><tr><th>Email</th><th>Role</th><th>Added</th><th></th></tr></thead><tbody id="users"></tbody></table>
+        <form id="addUser" class="row" style="margin-top:12px">
+          <input id="newEmail" class="grow" type="email" required placeholder="colleague@example.com" aria-label="New user's email">
+          <select id="newRole" aria-label="New user's role"><option value="viewer">viewer (read only)</option><option value="owner">owner</option></select>
+          <button>Add user</button>
+        </form>
+        <div id="userBox" class="secret" hidden></div>
+      </section>
+    </div>
   </div>
 </main>
 
 <script>
-let apiKey = '';
+let me = null;
 const $ = (id) => document.getElementById(id);
 const say = (msg, cls = 'muted') => { $('status').textContent = msg; $('status').className = cls; };
+const isOwner = () => me?.role === 'owner';
 
+// The session cookie goes along automatically (same origin, HttpOnly: this script never
+// sees it). Writes are always JSON: the server refuses cookie-authenticated writes that aren't.
 async function api(method, path, body) {
   const res = await fetch(path, {
     method,
-    headers: { Authorization: `Bearer ${apiKey}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: method === 'GET' ? {} : { 'Content-Type': 'application/json' },
+    body: method === 'GET' ? undefined : JSON.stringify(body ?? {}),
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && path !== '/api/auth/login') { signedOut('Your session ended. Sign in again.'); }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
 
-// Build DOM with textContent only - URLs and errors are customer-controlled.
+// Build DOM with textContent only - URLs, emails and errors are user-controlled.
 function el(tag, text, cls) { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
 function btn(label, onClick) { const b = el('button', label); b.type = 'button'; b.onclick = onClick; return b; }
 function tr(...cells) { const r = document.createElement('tr'); for (const c of cells) { const td = document.createElement('td'); c instanceof Node ? td.append(c) : td.textContent = c ?? ''; r.append(td); } return r; }
@@ -99,10 +128,11 @@ const when = (t) => t ? new Date(t).toLocaleString() : '';
 const short = (id) => el('code', id.slice(0, 8), null);
 // "a, b" -> ['a', 'b']; empty -> null (subscribed to every event type)
 const parseTypes = (s) => { const t = s.split(',').map((x) => x.trim()).filter(Boolean); return t.length ? t : null; };
+// Owner-only buttons aren't rendered for viewers; the server refuses them either way.
+const ownerBtn = (label, onClick) => (isOwner() ? btn(label, onClick) : '');
 
-function showSecret(secret, note) {
-  const box = $('secretBox');
-  box.replaceChildren(el('strong', 'Signing secret: '), el('code', secret), el('div', note, 'muted'));
+function showOnce(box, label, value, note) {
+  box.replaceChildren(el('strong', label), el('code', value), el('div', note, 'muted'));
   box.hidden = false;
 }
 
@@ -113,23 +143,23 @@ async function loadEndpoints() {
     const actions = el('div', null, 'row');
     actions.append(
       btn('History', () => loadHistory(ep)),
-      btn('Replay dead letters', () => run(async () => {
+      ownerBtn('Replay dead letters', () => run(async () => {
         if (!confirm(`Re-deliver every dead-lettered event for ${ep.url}, in their original order?`)) return;
         const r = await api('POST', `/api/endpoints/${ep.endpoint_id}/replay-dead`, {});
         say(`${r.requeued} dead letter(s) re-queued for this endpoint.`, 'ok');
         await loadDlq();
       })),
-      btn('Event types', () => run(async () => {
+      ownerBtn('Event types', () => run(async () => {
         const s = prompt('Event types this endpoint receives, comma-separated. Leave empty for every type.', (ep.event_types || []).join(', '));
         if (s === null) return;
         await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { event_types: parseTypes(s) });
         await loadEndpoints();
       })),
-      btn(ep.is_active ? 'Disable' : 'Enable', () => run(async () => { await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { is_active: !ep.is_active }); await loadEndpoints(); })),
-      btn('Rotate secret', () => run(async () => {
+      ownerBtn(ep.is_active ? 'Disable' : 'Enable', () => run(async () => { await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { is_active: !ep.is_active }); await loadEndpoints(); })),
+      ownerBtn('Rotate secret', () => run(async () => {
         if (!confirm('Rotate this endpoint\'s signing secret? The old one keeps working for 24 hours.')) return;
         const r = await api('POST', `/api/endpoints/${ep.endpoint_id}/rotate-secret`);
-        showSecret(r.secret, r.note);
+        showOnce($('secretBox'), 'Signing secret: ', r.secret, r.note);
       })),
     );
     return tr(el('code', ep.url), ep.event_types ? ep.event_types.join(', ') : 'all', ep.is_active ? 'yes' : 'no', el('span', ep.circuit, circuitCls), actions);
@@ -145,7 +175,7 @@ async function loadHistory(ep) {
     when(r.attempted_at), short(r.event_id), r.type, r.attempt_number,
     el('span', r.status === 'delivered' ? `delivered ${r.http_status_code}` : (r.error_detail || 'failed'), r.status === 'delivered' ? 'ok' : 'bad'),
     r.latency_ms != null ? `${r.latency_ms} ms` : '',
-    btn('Replay', () => replay(r.event_id, ep.endpoint_id, () => loadHistory(ep))),
+    ownerBtn('Replay', () => replay(r.event_id, ep.endpoint_id, () => loadHistory(ep))),
   )));
 }
 
@@ -156,17 +186,39 @@ async function loadDlq() {
   $('dlq').replaceChildren(...rows.map((r) => tr(
     when(r.terminal_at), short(r.event_id), el('code', r.url),
     el('span', r.dead_reason, 'bad'), r.last_error,
-    btn('Replay', () => replay(r.event_id, r.endpoint_id, loadDlq)),
+    ownerBtn('Replay', () => replay(r.event_id, r.endpoint_id, loadDlq)),
   )));
 }
 
 async function loadSettings() {
   const s = await api('GET', '/api/settings');
   $('schedule').value = (s.retry_schedule_minutes ?? []).join(', ');
+  $('schedule').readOnly = !isOwner();
   $('scheduleHint').textContent = s.retry_schedule_minutes
     ? `Custom schedule: ${s.retry_schedule_minutes.length} retries. Default is ${s.default_retry_schedule_minutes.join(', ')}.`
     : `Using the default: ${s.default_retry_schedule_minutes.join(', ')} minutes. 1-10 retries, each 1-1440 minutes.`;
 }
+
+async function loadUsers() {
+  if (!isOwner()) return;
+  const users = await api('GET', '/api/users');
+  $('users').replaceChildren(...users.map((u) => {
+    const actions = el('div', null, 'row');
+    const other = u.role === 'owner' ? 'viewer' : 'owner';
+    actions.append(
+      btn(`Make ${other}`, () => run(async () => { await api('PATCH', `/api/users/${u.user_id}`, { role: other }); await afterUserChange(u); })),
+      btn('Remove', () => run(async () => {
+        if (!confirm(`Remove ${u.email}? They are signed out at once.`)) return;
+        await api('DELETE', `/api/users/${u.user_id}`);
+        await afterUserChange(u);
+      })),
+    );
+    return tr(u.email + (u.email === me.email ? ' (you)' : ''), u.role, when(u.created_at), actions);
+  }));
+}
+
+// Changing your own role or removing yourself changes what this page may show.
+async function afterUserChange(u) { if (u.email === me.email) await start(); else await loadUsers(); }
 
 async function saveSchedule(schedule) {
   await run(async () => {
@@ -192,17 +244,60 @@ async function replay(eventId, endpointId, after) {
 
 async function run(fn) { try { await fn(); } catch (err) { say(err.message, 'bad'); } }
 
-$('login').onsubmit = (e) => { e.preventDefault(); apiKey = $('key').value.trim(); run(async () => {
-  await Promise.all([loadEndpoints(), loadDlq(), loadSettings()]);
-  $('app').hidden = false; say('Loaded.', 'ok');
+function signedOut(msg = '') {
+  me = null;
+  $('app').hidden = true; $('whoami').hidden = true; $('passwordForm').hidden = true; $('login').hidden = false;
+  say(msg);
+}
+
+// Signed in (or not) decides everything: ask the server rather than remember anything locally.
+async function start() {
+  try {
+    me = await api('GET', '/api/auth/me');
+  } catch {
+    return signedOut();
+  }
+  $('meEmail').textContent = me.email ?? '(API key)';
+  $('meRole').textContent = me.role;
+  $('meTenant').textContent = me.tenant_id;
+  for (const e of document.querySelectorAll('.owner-only')) e.hidden = !isOwner();
+  $('login').hidden = true; $('whoami').hidden = false;
+  await run(async () => {
+    await Promise.all([loadEndpoints(), loadDlq(), loadSettings(), loadUsers()]);
+    $('app').hidden = false;
+    say(isOwner() ? '' : 'Read-only: viewers can look but not change anything.');
+  });
+}
+
+$('login').onsubmit = (e) => { e.preventDefault(); run(async () => {
+  await api('POST', '/api/auth/login', { email: $('email').value, password: $('password').value });
+  $('password').value = '';
+  await start();
+}); };
+
+$('logout').onclick = () => run(async () => { await api('POST', '/api/auth/logout'); signedOut('Signed out.'); });
+$('showPassword').onclick = () => { $('passwordForm').hidden = !$('passwordForm').hidden; };
+$('passwordForm').onsubmit = (e) => { e.preventDefault(); run(async () => {
+  const r = await api('POST', '/api/auth/password', { current_password: $('currentPassword').value, new_password: $('newPassword').value });
+  $('currentPassword').value = ''; $('newPassword').value = ''; $('passwordForm').hidden = true;
+  say(`Password changed. ${r.other_sessions_signed_out} other session(s) signed out.`, 'ok');
 }); };
 
 $('create').onsubmit = (e) => { e.preventDefault(); run(async () => {
   const r = await api('POST', '/api/endpoints', { url: $('newUrl').value, event_types: parseTypes($('newTypes').value) });
   $('newUrl').value = ''; $('newTypes').value = '';
-  showSecret(r.secret, r.note);
+  showOnce($('secretBox'), 'Signing secret: ', r.secret, r.note);
   await loadEndpoints();
 }); };
+
+$('addUser').onsubmit = (e) => { e.preventDefault(); run(async () => {
+  const r = await api('POST', '/api/users', { email: $('newEmail').value, role: $('newRole').value });
+  $('newEmail').value = '';
+  showOnce($('userBox'), `Password for ${r.email}: `, r.password, r.note);
+  await loadUsers();
+}); };
+
+start();
 </script>
 </body>
 </html>

@@ -1,4 +1,16 @@
-// Tenant-facing Dashboard API + UI.  Authorization: Bearer <tenant API key>
+// Tenant-facing Dashboard API + UI. Two ways to authenticate (lib/auth.js):
+//   - people: POST /api/auth/login, then the session cookie. Owners can do everything below;
+//     viewers only the GETs (plus their own password and logout).
+//   - scripts: Authorization: Bearer <tenant API key>, with owner rights.
+//
+//   POST  /api/auth/login  {email, password}        sets the session cookie
+//   POST  /api/auth/logout
+//   GET   /api/auth/me                               who am I: email, role, tenant
+//   POST  /api/auth/password {current_password, new_password}   signs out your other sessions
+//   GET   /api/users                                 owners: this tenant's users
+//   POST  /api/users {email, role}                   owners: add a user; password returned ONCE
+//   PATCH /api/users/:id {role}                      owners: change a role (never the last owner)
+//   DELETE /api/users/:id                            owners: remove a user (never the last owner)
 //
 //   GET   /                                          dashboard UI
 //   GET   /api/endpoints                             list endpoints (+ circuit breaker state)
@@ -15,7 +27,7 @@
 //   GET   /api/settings                              this tenant's retry policy
 //   PUT   /api/settings   {retry_schedule_minutes}   own schedule, e.g. [1, 5, 30]; null = default
 //
-// Tenant isolation: tenant_id comes ONLY from the API key, and every query filters on it.
+// Tenant isolation: tenant_id comes ONLY from the credential, and every query filters on it.
 // Anything belonging to another tenant is a 404, same as if it didn't exist.
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -23,7 +35,9 @@ import { pathToFileURL } from 'node:url';
 import { pool, encryptSecret, retryPolicy, closeRedis } from './lib/infra.js';
 import { getBreaker } from './lib/breaker.js';
 import { assertSafeUrl } from './lib/deliver.js';
-import { sendJson, readJson, bearer, sha256 } from './lib/http.js';
+import { sendJson, readJson } from './lib/http.js';
+import { authenticate, login, sameOriginJson, sessionCookie, clearedCookie, EMAIL } from './lib/auth.js';
+import { hashPassword, verifyPassword, passwordProblem, generatePassword } from './core/password.js';
 import { log } from './lib/log.js';
 import { serveMetrics } from './lib/metrics.js';
 import { onShutdown } from './lib/shutdown.js';
@@ -36,11 +50,36 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const notFound = () => Object.assign(new Error('not found'), { status: 404 });
 const badRequest = (m) => Object.assign(new Error(m), { status: 400 });
 
-async function authenticate(req) {
-  const key = bearer(req);
-  if (!key) return null;
-  const { rows } = await pool.query('SELECT tenant_id FROM tenants WHERE api_key_hash = $1', [sha256(key)]);
-  return rows[0]?.tenant_id ?? null;
+const forbidden = (m) => Object.assign(new Error(m), { status: 403 });
+const ANY_ROLE = ['owner', 'viewer'];
+const lastOwner = () => Object.assign(new Error('a tenant must keep at least one owner'), { status: 409 });
+
+// Behind a load balancer every login would come from its address and share one per-IP
+// limit. With TRUST_PROXY=true the client address is the last X-Forwarded-For entry (the one
+// the balancer itself appended); never trust that header without a proxy in front.
+const clientIp = (req) => (process.env.TRUST_PROXY === 'true'
+  && (req.headers['x-forwarded-for'] || '').split(',').pop().trim()) || req.socket.remoteAddress;
+
+// Changes to a tenant's users run one at a time per tenant (a lock on its tenants row), so
+// two owners demoting each other at the same moment can't leave the tenant with none.
+async function changeUser(tenantId, userId, change) {
+  if (!UUID.test(userId)) throw notFound();
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    await db.query('SELECT 1 FROM tenants WHERE tenant_id = $1 FOR UPDATE', [tenantId]);
+    const { rows: [user] } = await db.query('SELECT role FROM users WHERE user_id = $1 AND tenant_id = $2', [userId, tenantId]);
+    if (!user) throw notFound();
+    const { rows: [{ owners }] } = await db.query(`SELECT count(*)::int AS owners FROM users WHERE tenant_id = $1 AND role = 'owner'`, [tenantId]);
+    const result = await change(db, user, owners);
+    await db.query('COMMIT');
+    return result;
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    db.release();
+  }
 }
 
 async function ownEndpoint(tenantId, endpointId) {
@@ -90,7 +129,63 @@ async function deliveryState(tenantId, eventId, endpointId) {
   };
 }
 
+// [method, path, handler(tenantId, params, body, who), roles allowed]. Roles default to
+// both for GET and owners only for anything that changes state.
 const routes = [
+  ['GET', /^\/api\/auth\/me$/, async (t, _, __, who) => ({ tenant_id: t, role: who.role, via: who.via, email: who.email ?? null })],
+
+  ['POST', /^\/api\/auth\/logout$/, async (t, _, __, who) => {
+    if (who.tokenHash) await pool.query('DELETE FROM sessions WHERE token_hash = $1', [who.tokenHash]);
+    return [200, { signed_out: true }, { 'Set-Cookie': clearedCookie() }];
+  }, ANY_ROLE],
+
+  ['POST', /^\/api\/auth\/password$/, async (t, _, body, who) => {
+    if (who.via !== 'session') throw badRequest('sign in with email and password to change a password');
+    const { rows: [u] } = await pool.query('SELECT password_hash FROM users WHERE user_id = $1', [who.userId]);
+    if (!(await verifyPassword(String(body.current_password ?? ''), u.password_hash))) throw forbidden('current password is wrong');
+    const problem = passwordProblem(body.new_password, who.email);
+    if (problem) throw badRequest(problem);
+    await pool.query('UPDATE users SET password_hash = $2 WHERE user_id = $1', [who.userId, await hashPassword(body.new_password)]);
+    // Anyone else signed in as this user (a stolen cookie, a forgotten laptop) is signed out.
+    const { rowCount } = await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2', [who.userId, who.tokenHash]);
+    return { changed: true, other_sessions_signed_out: rowCount };
+  }, ANY_ROLE],
+
+  ['GET', /^\/api\/users$/, async (t) => (await pool.query(
+    'SELECT user_id, email, role, created_at FROM users WHERE tenant_id = $1 ORDER BY created_at', [t])).rows, ['owner']],
+
+  ['POST', /^\/api\/users$/, async (t, _, body) => {
+    const email = String(body.email ?? '').trim().toLowerCase();
+    if (!EMAIL.test(email)) throw badRequest('a valid email is required');
+    if (!ANY_ROLE.includes(body.role)) throw badRequest('role must be owner or viewer');
+    const password = generatePassword();
+    try {
+      const { rows: [u] } = await pool.query(
+        'INSERT INTO users (tenant_id, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING user_id, email, role, created_at',
+        [t, email, await hashPassword(password), body.role]);
+      return [201, { ...u, password, note: 'Give this password to the user now - it will not be shown again. They should change it after signing in.' }];
+    } catch (err) {
+      if (err.code === '23505') return [409, { error: 'that email already has an account' }];
+      throw err;
+    }
+  }],
+
+  ['PATCH', /^\/api\/users\/([^/]+)$/, async (t, [id], body) => {
+    if (!ANY_ROLE.includes(body.role)) throw badRequest('role must be owner or viewer');
+    return changeUser(t, id, async (db, user, owners) => {
+      if (user.role === 'owner' && body.role !== 'owner' && owners === 1) throw lastOwner();
+      // Takes effect on the user's next request: sessions look the role up every time.
+      const { rows: [u] } = await db.query('UPDATE users SET role = $2 WHERE user_id = $1 RETURNING user_id, email, role', [id, body.role]);
+      return u;
+    });
+  }],
+
+  ['DELETE', /^\/api\/users\/([^/]+)$/, async (t, [id]) => changeUser(t, id, async (db, user, owners) => {
+    if (user.role === 'owner' && owners === 1) throw lastOwner();
+    await db.query('DELETE FROM users WHERE user_id = $1', [id]); // their sessions go too (ON DELETE CASCADE)
+    return { user_id: id, deleted: true };
+  })],
+
   ['GET', /^\/api\/endpoints$/, async (t) => {
     const { rows } = await pool.query(
       'SELECT endpoint_id, url, is_active, event_types, created_at, secret_rotated_at FROM endpoints WHERE tenant_id = $1 ORDER BY created_at',
@@ -238,15 +333,30 @@ export const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(await fs.readFile(new URL('./public/dashboard.html', import.meta.url)));
     }
-    for (const [method, pattern, handler] of routes) {
+    if (req.method === 'POST' && path === '/api/auth/login') {
+      // JSON and same-origin here too: otherwise another site could sign a visitor into the
+      // attacker's account (login CSRF).
+      if (!sameOriginJson(req)) return sendJson(res, 403, { error: 'cross-site or non-JSON request refused' });
+      const body = await readJson(req, 4096);
+      const token = await login(body.email, body.password, clientIp(req));
+      if (!token) return sendJson(res, 401, { error: 'wrong email or password' });
+      return sendJson(res, 200, { signed_in: true }, { 'Set-Cookie': sessionCookie(token) });
+    }
+    for (const [method, pattern, handler, roles = method === 'GET' ? ANY_ROLE : ['owner']] of routes) {
       const match = path.match(pattern);
       if (!match || req.method !== method) continue;
-      const tenantId = await authenticate(req);
-      if (!tenantId) return sendJson(res, 401, { error: 'invalid API key' });
+      const who = await authenticate(req);
+      if (!who) return sendJson(res, 401, { error: 'sign in, or send a tenant API key' });
+      // A browser sends the cookie with whatever request a page makes; only same-origin JSON
+      // may change anything (lib/auth.js). API-key calls carry no cookie, so need no check.
+      if (method !== 'GET' && who.via === 'session' && !sameOriginJson(req)) {
+        return sendJson(res, 403, { error: 'cross-site or non-JSON request refused' });
+      }
+      if (!roles.includes(who.role)) return sendJson(res, 403, { error: `a ${who.role} can't do this` });
       const body = method === 'GET' ? {} : await readJson(req);
-      const result = await handler(tenantId, match.slice(1).map(decodeURIComponent), body);
+      const result = await handler(who.tenantId, match.slice(1).map(decodeURIComponent), body, who);
       return Array.isArray(result) && typeof result[0] === 'number'
-        ? sendJson(res, result[0], result[1])
+        ? sendJson(res, result[0], result[1], result[2])
         : sendJson(res, 200, result);
     }
     sendJson(res, 404, { error: 'not found' });

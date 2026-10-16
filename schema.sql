@@ -44,6 +44,28 @@ END $$;
 -- W3C trace context of the ingest request, so retries hours later join the same trace.
 ALTER TABLE events ADD COLUMN IF NOT EXISTS traceparent TEXT;
 
+-- Dashboard users. Each belongs to one tenant: owners manage endpoints, secrets, replays,
+-- settings and users; viewers only read. (Tenant API keys still work for scripts.)
+CREATE TABLE IF NOT EXISTS users (
+  user_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     TEXT NOT NULL REFERENCES tenants(tenant_id),
+  email         TEXT NOT NULL,
+  password_hash TEXT NOT NULL,  -- scrypt (core/password.js), never the password
+  role          TEXT NOT NULL CHECK (role IN ('owner', 'viewer')),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users (lower(email));
+
+-- Login sessions. Only a SHA-256 of the cookie's token is stored, so a leaked copy of this
+-- table can't be replayed as a login.
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id    UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
+
 -- Where a tenant's events currently go. One tenant can have many endpoints.
 CREATE TABLE IF NOT EXISTS endpoints (
   endpoint_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

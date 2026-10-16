@@ -14,7 +14,8 @@ npm run ingest                # :3000  POST /events
 npm run consumer              # Kafka -> inline delivery attempt
 npm run worker                # retries, run as many as you like
 npm run retry-publisher       # re-publishes events whose Kafka publish failed; reconciler (below)
-npm run dashboard             # :3001  UI + API, dev keys: dev_key_tenant_a / dev_key_tenant_b
+npm run create-user -- tenant_a you@example.com owner   # prints a password once
+npm run dashboard             # :3001  sign in with it; scripts can use API keys (dev_key_tenant_a / _b)
 
 node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for the slow one)
 npm run retention             # dry run; --apply archives (archive/*.jsonl.gz) then deletes events > RETENTION_DAYS (35)
@@ -117,9 +118,22 @@ Induced-failure postmortems: [`production/incident-reports/`](production/inciden
 | `consumer.js` | Batched inline attempts (1s cap) or queue in `delivery_attempts` |
 | `delivery-worker.js` | Leased retries, oldest-first per endpoint, backoff, DLQ |
 | `dashboard-api.js` + `public/` | Tenant API + UI |
+| `lib/auth.js`, `core/password.js` | Dashboard sign-in: sessions, API keys, scrypt passwords |
 | `schema.sql` | Idempotent schema, also applied by `npm run migrate` |
 | `retention.js` | Archive-then-delete of events past the replay window |
 | `lib/rate-limit.js` | Per-tenant token bucket (atomic Lua script in Redis) |
+
+## Dashboard sign-in
+
+People sign in with email and password; scripts keep using a tenant API key (`Authorization: Bearer`), which acts as the tenant's owner.
+
+- **Roles:** an *owner* manages endpoints, secrets, replays, settings and users. A *viewer* can read everything but change nothing; the server refuses, and the UI hides the controls. A tenant always keeps at least one owner.
+- **Users:** the first owner comes from `npm run create-user`. After that, owners add users from the dashboard. A new user's password is generated and shown once, like a signing secret, and they change it after signing in. Changing a password signs out the user's other sessions.
+- **Passwords** are hashed with scrypt (Node's crypto, no dependency). Policy: 12 to 200 characters, and the password must not contain the email's name. An unknown email takes as long to reject as a wrong password, so timing doesn't reveal who has an account.
+- **Sessions:** a random 256-bit token in a cookie that is `HttpOnly`, `SameSite=Strict` and `Secure`, valid for 12 hours. Postgres stores only its SHA-256, so a leaked `sessions` table can't be replayed as logins.
+  - `Secure` works on `http://localhost`. Set `COOKIE_SECURE=false` only for another plain-HTTP host.
+- **Cross-site request forgery:** writes made with the cookie must be same-origin JSON. That covers login too, so another site can't sign a visitor into the attacker's account.
+- **Brute force:** login allows 5 attempts per email, then 1 a minute, and 30 per IP, then 1 every 10 seconds. It uses the Redis token bucket and, like ingest's limiter, fails open if Redis is down. Behind a load balancer, set `TRUST_PROXY=true` so the per-IP limit uses the client's address.
 
 **Per-tenant policy:** tenants set their own retry schedule from the dashboard (`PUT /api/settings`, 1–10 retries of 1–1440 min). Operators set rate limits in the database (`tenants.rate_limit_per_sec`, `rate_limit_burst`); `NULL` means the env default.
 

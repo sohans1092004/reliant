@@ -89,6 +89,8 @@ export async function runRetention({ days = 35, apply = false, archiveDir = 'arc
       client.release();
     }
   }
+  // Expired dashboard sessions: already refused at sign-in, this just stops them piling up.
+  await pool.query('DELETE FROM sessions WHERE expires_at <= NOW()');
   return { dryRun: false, events: total, files, droppedPartitions: await dropOldPartitions(cutoff) };
 }
 

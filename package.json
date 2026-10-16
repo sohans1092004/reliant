@@ -12,7 +12,8 @@
     "retry-publisher": "node retry-publisher.js",
     "dashboard": "node dashboard-api.js",
     "loadtest": "node loadtest/run.js",
-    "retention": "node retention.js"
+    "retention": "node retention.js",
+    "create-user": "node create-user.js"
   },
   "keywords": [],
   "author": "",

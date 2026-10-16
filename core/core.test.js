@@ -7,6 +7,7 @@ import { nextRetryDelay, validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from 
 import * as cb from './circuit-breaker.js';
 import * as sig from './signing.js';
 import { validateEvent, validateEventTypes } from './event.js';
+import { hashPassword, verifyPassword, passwordProblem } from './password.js';
 
 test('backoff: follows the schedule, within jitter bounds, never negative', () => {
   for (let n = 1; n <= DEFAULT_SCHEDULE_MINUTES.length; n++) {
@@ -120,4 +121,24 @@ test('subscription event types: null = all, else 1-50 valid type names', () => {
   for (const bad of [[], 'order.created', [''], ['has space'], [42], Array(51).fill('x')]) {
     assert.ok(validateEventTypes(bad), `accepted ${JSON.stringify(bad)}`);
   }
+});
+
+test('password: scrypt hash verifies, salts differ, wrong or tampered fails', async () => {
+  const pw = 'correct horse battery';
+  const [h1, h2] = [await hashPassword(pw), await hashPassword(pw)];
+  assert.match(h1, /^scrypt\$32768\$8\$1\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/);
+  assert.notEqual(h1, h2, 'same password, different salt');
+  assert.ok(!h1.includes(pw));
+  assert.ok(await verifyPassword(pw, h1));
+  assert.ok(!(await verifyPassword('correct horse battery!', h1)));
+  assert.ok(!(await verifyPassword(pw, h1.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A')))), 'tampered hash');
+  for (const bad of ['', 'plaintext', 'bcrypt$x$y']) assert.ok(!(await verifyPassword(pw, bad)), bad);
+});
+
+test('password: policy is length-based and rejects the email name', () => {
+  assert.equal(passwordProblem('long enough pass'), null);
+  assert.match(passwordProblem('short'), /at least 12/);
+  assert.match(passwordProblem('x'.repeat(201)), /at most 200/);
+  assert.match(passwordProblem('alice-password-1', 'alice@example.com'), /email name/);
+  assert.match(passwordProblem(12345678901234), /string/);
 });
