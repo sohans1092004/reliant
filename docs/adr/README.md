@@ -6,7 +6,7 @@ One file per decision: what was decided, why, and what it costs. Numbers follow 
 |---|---|---|
 | [001](0001-postgres-event-archive.md) | Postgres is the durable event archive, independent of Kafka retention | Accepted |
 | [002](0002-retry-queue-in-postgres.md) | Retries live in a Postgres queue, not Kafka retry topics (**reverses the spec**) | Accepted |
-| 003 | Self-hosted Kafka on EKS vs managed MSK | Not decided: no cloud deployment yet |
+| [003](0003-managed-msk.md) | Managed MSK, not Kafka self-hosted on EKS; durability settings pinned | Accepted (in Terraform, not yet run on AWS) |
 | [004](0004-kafka-for-primary-queue.md) | Kafka (not RabbitMQ) for the primary delivery queue | Accepted |
 | [005](0005-commit-offset-after-ledger-write.md) | Commit the Kafka offset only after the ledger write | Accepted |
 | [006](0006-autoscaling.md) | Autoscale consumer on Kafka lag and worker on due retry work (KEDA), not CPU or a fixed pool | Accepted |

@@ -1,0 +1,40 @@
+# Daily: archive events past the replay window to S3 (ARCHIVE_BUCKET, SSE-KMS), then
+# delete them; create next months' ledger partitions and drop old empty ones.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retention
+  labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: retention }
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid # two runs would only race for the same rows
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: reliant, app.kubernetes.io/component: retention }
+        spec:
+          serviceAccountName: retention
+          restartPolicy: OnFailure
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile: { type: RuntimeDefault }
+          volumes:
+            - { name: rds-ca, configMap: { name: rds-ca } }
+          containers:
+            - name: retention
+              image: reliant
+              command: ["node", "retention.js", "--apply"]
+              envFrom:
+                - configMapRef: { name: reliant-config }
+                - secretRef: { name: reliant-secrets }
+              volumeMounts:
+                - { name: rds-ca, mountPath: /etc/rds, readOnly: true }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }

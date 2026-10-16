@@ -42,6 +42,35 @@ jobs:
       - run: python -m unittest discover -s tests -v
         working-directory: sdk/python
 
+  terraform:
+    name: Terraform (fmt, validate, plan against LocalStack) + AWS overlay
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.6
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+      - name: Start LocalStack (KMS, S3, STS, IAM, EC2)
+        run: docker compose --profile aws up -d --wait reliant_localstack
+        working-directory: .
+      # Never touches AWS: localstack=true sends every call to localhost:4566.
+      - run: terraform plan -input=false -var localstack=true
+      # The overlay renders with placeholder inputs (the real ones come from terraform output).
+      - name: Render k8s/aws
+        working-directory: k8s/aws
+        run: |
+          echo DB_HOST=x > config.env
+          echo DB_PASSWORD=x > secrets.env
+          echo placeholder > rds-global-bundle.pem
+          kubectl kustomize . > /dev/null
+
   integration:
     name: Integration tests (Postgres + Redis + Redpanda + LocalStack KMS/S3)
     needs: unit

@@ -5,3 +5,10 @@ archive/
 k8s/local/secrets.env
 __pycache__/
 *.egg-info/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+k8s/aws/config.env
+k8s/aws/secrets.env
+k8s/aws/rds-global-bundle.pem

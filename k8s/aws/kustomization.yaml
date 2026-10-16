@@ -1,0 +1,54 @@
+# AWS (EKS) overlay: the same k8s/app, pointed at what infra/terraform creates.
+#   cd infra/terraform && terraform output -raw k8s_config_env > ../../k8s/aws/config.env
+#   curl -o k8s/aws/rds-global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+#   cp k8s/aws/secrets.env.example k8s/aws/secrets.env   # DB_PASSWORD from Secrets Manager, INGEST_TOKEN
+#   cd k8s/aws && kustomize edit set image reliant=<ecr_repository_url>:<git sha>
+#   kubectl apply -k k8s/aws
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: reliant
+resources:
+  - namespace.yaml
+  - ../app
+  - serviceaccounts.yaml
+  - retention-cronjob.yaml
+
+images:
+  - name: reliant
+    newName: reliant # replaced by `kustomize edit set image` with the ECR image
+
+configMapGenerator:
+  - name: reliant-config
+    envs:
+      - config.env # generated from terraform output, gitignored
+  - name: rds-ca
+    files:
+      - global-bundle.pem=rds-global-bundle.pem # Amazon's RDS CA bundle, gitignored
+
+secretGenerator:
+  - name: reliant-secrets
+    envs:
+      - secrets.env # gitignored; see secrets.env.example
+
+patches:
+  # Each process that calls AWS runs as the service account its IAM role is bound to
+  # (infra/terraform/iam.tf). Ingest and retry-publisher keep the default: no AWS access.
+  - target: { kind: Deployment, name: consumer }
+    patch: '[{"op": "add", "path": "/spec/template/spec/serviceAccountName", "value": "consumer"}]'
+  - target: { kind: Deployment, name: worker }
+    patch: '[{"op": "add", "path": "/spec/template/spec/serviceAccountName", "value": "worker"}]'
+  - target: { kind: Deployment, name: dashboard }
+    patch: '[{"op": "add", "path": "/spec/template/spec/serviceAccountName", "value": "dashboard"}]'
+  - target: { kind: Job, name: migrate }
+    patch: '[{"op": "add", "path": "/spec/template/spec/serviceAccountName", "value": "migrate"}]'
+  # RDS requires TLS; DB_SSL_CA (config.env) points at this bundle in every app pod.
+  - target: { kind: Deployment, labelSelector: app.kubernetes.io/name=reliant }
+    patch: &rds-ca |-
+      - op: add
+        path: /spec/template/spec/volumes
+        value: [{ name: rds-ca, configMap: { name: rds-ca } }]
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value: [{ name: rds-ca, mountPath: /etc/rds, readOnly: true }]
+  - target: { kind: Job, labelSelector: app.kubernetes.io/name=reliant }
+    patch: *rds-ca

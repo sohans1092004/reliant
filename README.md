@@ -34,6 +34,25 @@ node --test tests/aws.test.js         # CI runs every integration test this way
 - **Archives:** with `ARCHIVE_BUCKET` set, retention uploads each batch to `s3://<bucket>/events/YYYY-MM-DD/`, encrypted at rest under the KMS key (SSE-KMS), before deleting the rows.
 - **Don't keep `KMS_KEY_ID` in `.env` locally:** LocalStack's free edition keeps no state, so after a restart its key is gone and secrets wrapped under it can't be decrypted (rotate them to recover).
 
+## AWS infrastructure (Terraform)
+
+[`infra/terraform/`](infra/terraform/README.md) creates the AWS version of the stack:
+- a VPC over 3 AZs
+- EKS with Pod Identity, plus an ECR repository
+- RDS Postgres 16 (Multi-AZ, TLS, point-in-time recovery)
+- ElastiCache Redis and MSK, both with TLS (ADR-003)
+- the KMS key and archive bucket
+- one least-privilege IAM role per process
+
+[`k8s/aws/`](k8s/aws/kustomization.yaml) runs the same `k8s/app` on it: service accounts bound to those roles, the RDS CA bundle, and a daily retention CronJob.
+
+None of it has been applied to a real account. CI checks it with `terraform fmt`, `validate`, and a `plan` against LocalStack (100 resources), and renders the overlay. The KMS, S3 and IAM parts have been applied to LocalStack and tested there.
+
+The app reads three settings for the AWS services:
+- `KAFKA_SSL=true` and a comma-separated `KAFKA_BROKER` list for MSK
+- `DB_SSL_CA` for RDS TLS with certificate verification
+- a `rediss://` URL for ElastiCache TLS
+
 ## Containers and Kubernetes
 
 One image runs every process; each Kubernetes Deployment just runs a different command.
@@ -53,7 +72,7 @@ kubectl apply -k k8s/local/autoscaling                    # consumer on Kafka la
 ```
 
 - `k8s/app/`: Reliant itself, environment-agnostic. Five Deployments, ingest and dashboard Services, and a `migrate` Job that is safe to re-run. Every pod runs non-root with a read-only root filesystem, drops all capabilities, and has probes and resource requests.
-- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda, plus config and secrets. `redpanda-bootstrap.yaml` (also used by docker compose) turns Redpanda's write caching off, so a Kafka ack means the event is on disk, and turns off two Enterprise-licensed features the image enables by default. An AWS overlay would point the same `k8s/app` at RDS, ElastiCache and MSK.
+- `k8s/local/`: an overlay that adds single-replica Postgres, Redis and Redpanda, plus config and secrets. `redpanda-bootstrap.yaml` (also used by docker compose) turns Redpanda's write caching off, so a Kafka ack means the event is on disk, and turns off two Enterprise-licensed features the image enables by default. `k8s/aws/` points the same `k8s/app` at RDS, ElastiCache and MSK (see AWS infrastructure above).
   - **Dev only, no persistence:** restarting the Postgres or Redpanda pod wipes them. After that, run `kubectl -n reliant delete job migrate --ignore-not-found && kubectl apply -k k8s/local` to recreate the schema and topics. The migrate Job deletes itself 30s after finishing, so re-applying re-runs it.
   - **Addresses are fully qualified** (`*.reliant.svc.cluster.local`), so KEDA's scalers in the `keda` namespace can reach them too.
 - Every process shuts down gracefully on SIGTERM (`lib/shutdown.js`): it stops taking new work, finishes what's in flight, and force-exits at 25s, inside Kubernetes' 30s grace period. Verified in Docker: a worker sent SIGTERM mid-delivery finished the delivery, recorded it in the ledger, and exited with code 0 after 3.2s.
@@ -130,5 +149,5 @@ Smaller deviations:
 - **Subscriptions are an `event_types` list on the endpoint** (NULL = every type), not a separate `subscriptions` table: same capability, one fewer join on the hot path.
 - **Dead letters are `delivery_attempts` rows with `status = 'dead'`**, not a separate `dead_letters` table, and there's no `delivery_status` projection table: `delivery_attempts` plus the ledger answer the status API (p95 13–23ms over 1M ledger rows, `docs/load-test-results.md` §6).
 - **Ledger partitions older than the cutoff are dropped once empty**, rather than archived per partition: retention already archives each event with its ledger rows (to S3 with `ARCHIVE_BUCKET`, else local gzip files).
-- **KMS and S3 are built and tested against LocalStack, not a real AWS account:** envelope encryption of endpoint secrets and S3 archives (see below). LocalStack's free edition doesn't offer EKS, RDS, MSK or ElastiCache.
-- **Not built (costs money):** the managed AWS services (EKS, RDS, MSK, ElastiCache), Terraform, the deploy stage of CI/CD, ADR-003.
+- **AWS is written and checked, never applied to a real account** (that costs money): Terraform for the whole stack and a `k8s/aws` overlay (below). KMS and S3 are also exercised by the app's tests against LocalStack.
+- **Not built:** the deploy stage of CI/CD (push to ECR, apply to EKS), dashboard exposure (ALB + certificate), KEDA on EKS.

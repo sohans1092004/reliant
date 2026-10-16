@@ -41,7 +41,7 @@ services:
     image: localstack/localstack:4.9.2 # free edition, no account token needed
     profiles: [aws]
     environment:
-      SERVICES: kms,s3
+      SERVICES: kms,s3,sts,iam,ec2 # the last three only for terraform plan (infra/terraform)
     ports:
       - "4566:4566"
     volumes:
