@@ -162,7 +162,7 @@ async function loadEndpoints() {
         showOnce($('secretBox'), 'Signing secret: ', r.secret, r.note);
       })),
     );
-    return tr(el('code', ep.url), ep.event_types ? ep.event_types.join(', ') : 'all', ep.is_active ? 'yes' : 'no', el('span', ep.circuit, circuitCls), actions);
+    return tr(el('code', ep.url), ep.event_types ? ep.event_types.join(', ') : 'all', ep.is_active ? 'yes' : ep.disabled_reason === 'http_410' ? el('span', 'no: endpoint answered 410 Gone', 'bad') : 'no', el('span', ep.circuit, circuitCls), actions);
   }));
 }
 

@@ -34,7 +34,7 @@ The ping result also feeds the circuit breaker. A healthy ping resets the failur
 
 ## Consequences
 
-- Worst-case head-of-line stall for an event the endpoint keeps rejecting drops from about 14.6 hours to about 6 minutes, i.e. 3 attempts. A genuinely down endpoint still gets the full retry schedule, as before.
+- Worst-case head-of-line stall for an event the endpoint keeps rejecting drops from about 14.6 hours to about 6 minutes, i.e. 3 attempts. A genuinely down endpoint still gets the full retry schedule, as before; when it runs out, the events queued behind it go to the DLQ with it ([ADR-009](0009-status-codes-and-dead-endpoint-backlogs.md)).
 - An endpoint that is down receives up to 4 extra ping requests per event (after attempts 3 to 6). That's negligible, and the circuit breaker stops both pings and attempts once it opens.
 - **A set-aside event breaks order once:** later events are delivered before it, and a replay delivers it out of order. Receivers that care must reconcile with event timestamps, which they should do anyway under at-least-once delivery.
 - **Misclassification is possible.** A receiver that answers pings without checking anything (a static 200) but fails *every* real event because its handler is broken will have each event set aside after 3 attempts instead of retried for 14 hours. The events aren't lost; they all land in the DLQ and can be replayed in bulk after the fix. The reverse also happens: an endpoint that fails pings for reasons unrelated to its health gets the full backoff, which is the old behaviour.

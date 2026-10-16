@@ -13,7 +13,8 @@
     "dashboard": "node dashboard-api.js",
     "loadtest": "node loadtest/run.js",
     "retention": "node retention.js",
-    "create-user": "node create-user.js"
+    "create-user": "node create-user.js",
+    "create-tenant": "node create-tenant.js"
   },
   "keywords": [],
   "author": "",

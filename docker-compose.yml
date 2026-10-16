@@ -10,7 +10,8 @@ services:
       - "5432:5432"
     volumes:
       # Runs only when the DB volume is empty (first start / after a wipe).
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./schema.sql:/docker-entrypoint-initdb.d/1-schema.sql
+      - ./seed-dev.sql:/docker-entrypoint-initdb.d/2-seed-dev.sql
 
   # Fast, temporary memory: circuit-breaker state, rate-limit counters, later on.
   reliant_redis:
@@ -27,8 +28,10 @@ services:
       - --memory 512M
       - --overprovisioned
       - --node-id 0
-      - --kafka-addr PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+      # DRILL: a second listener, advertised under a name that only resolves on the networks
+      # the partition drill creates (loadtest/run.js consumer-partition). Unused otherwise.
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,DRILL://0.0.0.0:29092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092,DRILL://reliant-kafka-drill:29092
     volumes:
       - ./k8s/local/redpanda-bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
     ports:

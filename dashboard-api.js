@@ -188,7 +188,7 @@ const routes = [
 
   ['GET', /^\/api\/endpoints$/, async (t) => {
     const { rows } = await pool.query(
-      'SELECT endpoint_id, url, is_active, event_types, created_at, secret_rotated_at FROM endpoints WHERE tenant_id = $1 ORDER BY created_at',
+      'SELECT endpoint_id, url, is_active, disabled_reason, disabled_at, event_types, created_at, secret_rotated_at FROM endpoints WHERE tenant_id = $1 ORDER BY created_at',
       [t],
     );
     for (const ep of rows) ep.circuit = (await getBreaker(ep.endpoint_id).catch(() => ({ state: 'unknown' }))).state;
@@ -217,9 +217,12 @@ const routes = [
     const problem = setTypes && validateEventTypes(body.event_types);
     if (problem) throw badRequest(problem);
     const { rows } = await pool.query(
+      // Any on/off change by a person clears why Reliant turned it off (a 410).
       `UPDATE endpoints SET is_active = CASE WHEN $3 THEN $4 ELSE is_active END,
+                            disabled_reason = CASE WHEN $3 THEN NULL ELSE disabled_reason END,
+                            disabled_at = CASE WHEN $3 THEN NULL ELSE disabled_at END,
                             event_types = CASE WHEN $5 THEN $6::text[] ELSE event_types END
-       WHERE endpoint_id = $1 AND tenant_id = $2 RETURNING endpoint_id, url, is_active, event_types`,
+       WHERE endpoint_id = $1 AND tenant_id = $2 RETURNING endpoint_id, url, is_active, disabled_reason, event_types`,
       [id, t, setActive, setActive ? body.is_active : null, setTypes, setTypes ? body.event_types : null],
     );
     return rows[0];
@@ -280,7 +283,7 @@ const routes = [
   // Still scoped to one endpoint - never a broadcast to other endpoints.
   ['POST', /^\/api\/endpoints\/([^/]+)\/replay-dead$/, async (t, [id], body) => {
     await ownEndpoint(t, id);
-    const reasons = ['delivery_exhausted', 'payload_rejected', 'processing_error'];
+    const reasons = ['delivery_exhausted', 'payload_rejected', 'processing_error', 'endpoint_unreachable', 'endpoint_gone'];
     if (body.reason !== undefined && !reasons.includes(body.reason)) throw badRequest(`reason must be one of ${reasons.join(', ')}`);
     // One statement, so they all get the same created_at; the worker then breaks the
     // tie by id, i.e. the order they were originally queued in. NOW() puts them behind

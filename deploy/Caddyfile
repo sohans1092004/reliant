@@ -1,0 +1,28 @@
+# HTTPS for Reliant. Caddy gets and renews a Let's Encrypt certificate for $DOMAIN by itself
+# (ports 80 and 443 must reach this VM). DOMAIN=localhost gives a local self-signed one.
+
+{$DOMAIN} {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Producers: POST /events with the INGEST_TOKEN.
+	handle /events {
+		reverse_proxy ingest:3000
+	}
+
+	# The demo receiver (compose profile "demo"). Register https://$DOMAIN/demo-receiver/webhooks.
+	handle_path /demo-receiver/* {
+		reverse_proxy receiver:8080
+	}
+
+	# Everything else: the dashboard and its API.
+	handle {
+		reverse_proxy dashboard:3001
+	}
+}

@@ -9,6 +9,7 @@ docker compose up -d          # Postgres, Redis, Redpanda
 cp .env.example .env          # fill in DB creds, SECRET_ENCRYPTION_KEY, INGEST_TOKEN
 npm install
 npm run migrate               # schema + Kafka topics (12 partitions; grows only at zero lag) + signing secrets (get one via "Rotate secret")
+                              # + dev tenants tenant_a / tenant_b, because .env has DEV_SEED=true (never on a public server)
 
 npm run ingest                # :3000  POST /events
 npm run consumer              # Kafka -> inline delivery attempt
@@ -20,6 +21,8 @@ npm run dashboard             # :3001  sign in with it; scripts can use API keys
 node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for the slow one)
 npm run retention             # dry run; --apply archives (archive/*.jsonl.gz) then deletes events > RETENTION_DAYS (35)
 ```
+
+**Live on one VM:** [`deploy/`](deploy/README.md) runs the whole stack with `docker compose` behind Caddy (automatic HTTPS), with a demo receiver and the public-exposure settings fixed. Tenants there come from `npm run create-tenant -- <id> "<name>"`, which prints the API key once.
 
 ## AWS: KMS and S3 (against LocalStack)
 
@@ -88,11 +91,14 @@ npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for
 npm run loadtest -- recovery-spec  # spec benchmark: 600k backlog drained within 5 min (LT_CONSUMERS)
 npm run loadtest -- dashboard # dashboard query latency over 1M ledger rows
 npm run loadtest -- pg-outage # kill Postgres mid-traffic (docker on PATH); also redis-outage, kafka-outage
-bash loadtest/k8s-pg-outage.sh # the same Postgres drill against the k8s/local deployment
+bash loadtest/k8s-drill.sh pg-outage   # the same Postgres drill against the k8s/local deployment (also k8s-scale-out, k8s-rolling-restart)
 LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-freeze  # zombie consumer (needs reliant:dev image)
+npm run loadtest -- redis-hang  # Redis down while every tenant also has a hanging endpoint
+LT_SINK_HOST=host.docker.internal npm run loadtest -- lease-double-send   # worker frozen mid-POST past its lease
+LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-partition  # one consumer cut off the broker, still running
 ```
 
-Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
+Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md). Failure drills, round 2: [`docs/drills.md`](docs/drills.md).
 Induced-failure postmortems: [`production/incident-reports/`](production/incident-reports/).
 
 ## Observability
@@ -142,6 +148,8 @@ People sign in with email and password; scripts keep using a tenant API key (`Au
 Every request is a signed `POST` with `webhook-id` (= `event_id`), `webhook-timestamp` and `webhook-signature` (`v1,<base64 HMAC-SHA256 of id.timestamp.body>`, keyed with the base64-decoded part of the `whsec_` secret; two signatures, space-separated, during a secret rotation). See `verify()` in `core/signing.js`. Receivers should:
 
 - return 2xx only once the event is handled; anything else is retried
+- to slow Reliant down, answer `429` (or `503`) with `Retry-After`: the next try waits that long (up to 24h)
+- answer `410 Gone` to stop deliveries for good: Reliant disables the endpoint and dead-letters what was queued for it; an owner can turn it back on and replay ([ADR-009](docs/adr/0009-status-codes-and-dead-endpoint-backlogs.md))
 - deduplicate on `webhook-id`, because delivery is at-least-once
 - answer `type: "reliant.ping"` with 2xx and do nothing else; Reliant uses it to tell a broken endpoint from one bad event
 
@@ -154,7 +162,7 @@ Every request is a signed `POST` with `webhook-id` (= `event_id`), `webhook-time
 Decisions and their trade-offs are in [`docs/adr/`](docs/adr/README.md). The two that differ from the spec:
 
 - **[ADR-002](docs/adr/0002-retry-queue-in-postgres.md):** retries use a Postgres queue (`delivery_attempts`), not Kafka retry topics.
-- **[ADR-008](docs/adr/0008-ordering-guarantee.md):** delivery is completion-ordered per endpoint, not initiation-ordered. If an event fails 3 times, the endpoint is pinged. If the ping succeeds, the event is the problem: it's dead-lettered as `payload_rejected` (replayable) so it stops blocking the queue.
+- **[ADR-008](docs/adr/0008-ordering-guarantee.md):** delivery is completion-ordered per endpoint, not initiation-ordered. If an event fails 3 times, the endpoint is pinged. If the ping succeeds, the event is the problem: it's dead-lettered as `payload_rejected` (replayable) so it stops blocking the queue. If the ping fails too and the event runs out of retries, the events queued behind it go to the DLQ with it, so none waits more than one retry cycle ([ADR-009](docs/adr/0009-status-codes-and-dead-endpoint-backlogs.md)).
 
 Smaller deviations:
 

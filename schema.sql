@@ -80,6 +80,10 @@ ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS secret_rotated_at         TIMESTA
 ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW();
 -- Subscriptions (spec FR2): which event types this endpoint receives. NULL = every type.
 ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS event_types               TEXT[];
+-- Set when Reliant turned the endpoint off itself (http_410: the receiver answered 410 Gone).
+-- Cleared when an owner turns it back on.
+ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS disabled_reason           TEXT;
+ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS disabled_at               TIMESTAMPTZ;
 
 -- Current delivery state per (event, endpoint) - the "what happened to my webhook" projection.
 -- Only written when the inline attempt didn't succeed (or on replay); a clean inline
@@ -95,7 +99,7 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
   last_error    TEXT
 );
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS last_http_status  INT;
-ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS dead_reason       TEXT;  -- delivery_exhausted | payload_rejected | processing_error
+ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS dead_reason       TEXT;  -- delivery_exhausted | payload_rejected | processing_error | endpoint_unreachable | endpoint_gone
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS terminal_at       TIMESTAMPTZ;
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS locked_until      TIMESTAMPTZ;  -- worker lease
 ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS processing_errors INT NOT NULL DEFAULT 0;
@@ -182,16 +186,4 @@ BEGIN
   END IF;
 END $$;
 
--- Dev seed. Dashboard API keys: dev_key_tenant_a / dev_key_tenant_b. Local only.
-INSERT INTO tenants (tenant_id, name, api_key_hash) VALUES
-  ('tenant_a', 'Tenant A', encode(sha256('dev_key_tenant_a'::bytea), 'hex')),
-  ('tenant_b', 'Tenant B', encode(sha256('dev_key_tenant_b'::bytea), 'hex'))
-ON CONFLICT DO NOTHING;
-
--- tenant_b points at fake-slow-endpoint.js. Replace tenant_a's URL with your webhook.site one.
-INSERT INTO endpoints (tenant_id, url)
-SELECT * FROM (VALUES
-  ('tenant_a', 'https://webhook.site/REPLACE-ME'),
-  ('tenant_b', 'http://localhost:9998')
-) AS seed(tenant_id, url)
-WHERE NOT EXISTS (SELECT 1 FROM endpoints);
+-- Dev tenants (known API keys) are in seed-dev.sql, applied only with DEV_SEED=true.

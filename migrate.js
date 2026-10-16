@@ -6,6 +6,10 @@ import { generateSecret } from './core/signing.js';
 
 await pool.query(await fs.readFile(new URL('./schema.sql', import.meta.url), 'utf8'));
 console.log('Schema applied.');
+if (process.env.DEV_SEED === 'true') { // local dev only: tenants with API keys published in the repo
+  await pool.query(await fs.readFile(new URL('./seed-dev.sql', import.meta.url), 'utf8'));
+  console.log('Dev tenants seeded (DEV_SEED=true).');
+}
 
 const { rows } = await pool.query('SELECT endpoint_id, tenant_id, url FROM endpoints WHERE secret_encrypted IS NULL');
 for (const ep of rows) {

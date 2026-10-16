@@ -124,28 +124,67 @@ async function claimDueDeliveries() {
 async function updateLeased(attempt, set, params = []) {
   const { rowCount } = await pool.query(`UPDATE delivery_attempts SET ${set} WHERE id = $1 AND lease = $2`,
     [attempt.id, attempt.lease, ...params]);
-  if (!rowCount) {
-    metrics.leaseLost.inc();
-    log.warn('lease lost: another worker owns this row now, outcome not recorded on it',
-      { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id });
-  }
+  if (!rowCount) leaseLost(attempt);
   return rowCount > 0;
 }
 
-async function deadLetter(attempt, reason, error) {
-  if (!await updateLeased(attempt,
-    `status = 'dead', dead_reason = $3, last_error = $4, terminal_at = NOW(), locked_until = NULL`, [reason, error])) return;
+function leaseLost(attempt) {
+  metrics.leaseLost.inc();
+  log.warn('lease lost: another worker owns this row now, outcome not recorded on it',
+    { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id });
+}
+
+// Dead-letters the claimed row (fenced on its lease). With `backlogReason`, every other
+// pending row of the endpoint goes with it, in the same statement. That's for when the
+// ENDPOINT is the problem: rows queued behind the head can't be delivered before it
+// (ADR-008), and each would otherwise start its own full retry cycle against a dead
+// endpoint, so K queued events took K x ~14.6h to clear. Now none waits more than one
+// cycle. Replay-dead re-queues them in their original order once the endpoint is back.
+async function deadLetter(attempt, reason, error, backlogReason = null) {
+  const why = reason === 'endpoint_gone' ? 'got 410 Gone' : 'used up its retries';
+  const { rows } = await pool.query(
+    `WITH head AS (
+       UPDATE delivery_attempts SET status = 'dead', dead_reason = $3, last_error = $4, terminal_at = NOW(), locked_until = NULL
+       WHERE id = $1 AND lease = $2 RETURNING endpoint_id
+     ), backlog AS (
+       UPDATE delivery_attempts da
+       SET status = 'dead', dead_reason = $5, last_error = $6, terminal_at = NOW(), locked_until = NULL
+       FROM head
+       WHERE $5::text IS NOT NULL AND da.endpoint_id = head.endpoint_id AND da.status = 'pending' AND da.id <> $1
+         AND (da.locked_until IS NULL OR da.locked_until < NOW())
+       RETURNING da.event_id
+     )
+     SELECT $7::uuid AS event_id FROM head
+     UNION ALL SELECT event_id FROM backlog`,
+    [attempt.id, attempt.lease, reason, error, backlogReason, `queued behind ${attempt.event_id}, which ${why}`, attempt.event_id],
+  );
+  if (!rows.length) return leaseLost(attempt);
+  const backlog = rows.length - 1;
   // Postgres is the source of truth; the topic is just a fan-out for alerting tools.
   await dlqProducer.send({
     topic: TOPICS.dlq,
-    messages: [{ key: attempt.tenant_id, value: JSON.stringify({
-      reason, event_id: attempt.event_id, endpoint_id: attempt.endpoint_id,
-      tenant_id: attempt.tenant_id, last_error: error,
-    }) }],
-  }).catch((err) => log.error('DLQ topic publish failed (row is still dead in Postgres)', { event_id: attempt.event_id, err }));
+    messages: rows.map((r, i) => ({ key: attempt.tenant_id, value: JSON.stringify({
+      reason: i ? backlogReason : reason, event_id: r.event_id, endpoint_id: attempt.endpoint_id,
+      tenant_id: attempt.tenant_id, last_error: i ? `queued behind ${attempt.event_id}, which ${why}` : error,
+    }) })),
+  }).catch((err) => log.error('DLQ topic publish failed (rows are still dead in Postgres)', { event_id: attempt.event_id, err }));
   metrics.deadLetters.inc({ reason });
-  trace.getActiveSpan()?.addEvent('dead_lettered', { reason });
-  log.warn('dead-lettered', { reason, event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id, error });
+  if (backlog) metrics.deadLetters.inc({ reason: backlogReason }, backlog);
+  trace.getActiveSpan()?.addEvent('dead_lettered', { reason, backlog });
+  log.warn('dead-lettered', { reason, event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id,
+    error, ...(backlog && { backlog_dead_lettered: backlog }) });
+}
+
+// 410 Gone is the receiver saying "stop sending here, for good" (the Standard Webhooks
+// convention). It's the only status trusted that far: anything else could be a deploy or a
+// bug (ADR-008). An owner re-enables the endpoint and replays its dead letters.
+async function disableEndpoint(attempt, reason) {
+  const { rowCount } = await pool.query(
+    'UPDATE endpoints SET is_active = FALSE, disabled_reason = $2, disabled_at = NOW() WHERE endpoint_id = $1 AND is_active',
+    [attempt.endpoint_id, reason]);
+  if (!rowCount) return;
+  metrics.endpointsDisabled.inc({ reason });
+  log.warn('endpoint disabled', { endpoint_id: attempt.endpoint_id, tenant_id: attempt.tenant_id, reason });
 }
 
 async function processOneDelivery(attempt) {
@@ -177,25 +216,41 @@ async function processOneDelivery(attempt) {
     return;
   }
 
-  // Endpoint problem or event problem? From PROBE_AFTER failures on, ping the endpoint.
-  // Healthy ping = the endpoint works but keeps refusing THIS event: set it aside so it
-  // stops blocking every later event for this endpoint (ADR-008). Failed ping = the
-  // endpoint is down: keep this event at the head and keep backing off.
+  if (result.httpStatus === 410) {
+    if (!await updateLeased(attempt, `attempt_count = $3, last_http_status = $4`, [attemptNumber, 410])) return;
+    await disableEndpoint(attempt, 'http_410');
+    await deadLetter(attempt, 'endpoint_gone', `${result.error}: endpoint disabled`, 'endpoint_gone');
+    return;
+  }
+
+  // Endpoint problem or event problem? From PROBE_AFTER failures on, and before giving up,
+  // ping the endpoint. Healthy ping = the endpoint works but keeps refusing THIS event:
+  // set it aside so it stops blocking every later event for this endpoint (ADR-008).
+  // Failed ping = the endpoint is down: keep this event at the head and keep backing off.
+  // Not on a 429: that's the endpoint throttling us, and a ping it happens to let through
+  // would wrongly blame the event.
+  const scheduled = nextRetryDelay(attemptNumber, retryPolicyFor(attempt.retry_schedule_minutes));
   let endpointHealthy = false;
-  if (attemptNumber >= PROBE_AFTER) {
+  if ((attemptNumber >= PROBE_AFTER || scheduled === null) && result.httpStatus !== 429) {
     endpointHealthy = (await pingEndpoint(attempt, attempt.tenant_id, PING_TIMEOUT_MS)).ok;
     metrics.pings.inc({ result: endpointHealthy ? 'healthy' : 'failed' });
     log.info('endpoint probed', { event_id: attempt.event_id, endpoint_id: attempt.endpoint_id, attempt: attemptNumber,
       verdict: endpointHealthy ? 'event is the problem' : 'endpoint is the problem' });
   }
 
-  const delayMs = nextRetryDelay(attemptNumber, retryPolicyFor(attempt.retry_schedule_minutes));
-  if (endpointHealthy || delayMs === null) {
+  if (endpointHealthy) {
     if (!await updateLeased(attempt, `attempt_count = $3, last_http_status = $4`, [attemptNumber, result.httpStatus])) return;
-    await deadLetter(attempt, endpointHealthy ? 'payload_rejected' : 'delivery_exhausted',
-      endpointHealthy ? `${result.error} (endpoint answered a ping fine, so this event is the problem)` : result.error);
+    await deadLetter(attempt, 'payload_rejected', `${result.error} (endpoint answered a ping fine, so this event is the problem)`);
     return;
   }
+  if (scheduled === null) { // out of retries and the endpoint itself is failing: its backlog goes too
+    if (!await updateLeased(attempt, `attempt_count = $3, last_http_status = $4`, [attemptNumber, result.httpStatus])) return;
+    await deadLetter(attempt, 'delivery_exhausted', result.error, 'endpoint_unreachable');
+    return;
+  }
+  // The receiver's own Retry-After (429/503) wins over the schedule. The attempt still
+  // counts, so an endpoint that throttles forever still ends in the DLQ.
+  const delayMs = result.retryAfterMs ?? scheduled;
   if (!await updateLeased(attempt,
     `attempt_count = $3, next_retry_at = NOW() + ($4 * INTERVAL '1 millisecond'), last_error = $5, last_http_status = $6, locked_until = NULL`,
     [attemptNumber, delayMs, result.error, result.httpStatus])) return;

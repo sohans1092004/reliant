@@ -13,7 +13,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY core ./core
 COPY lib ./lib
 COPY public ./public
-COPY *.js schema.sql ./
+COPY *.js schema.sql seed-dev.sql ./
 
 # The base image ships an unprivileged "node" user.
 USER node

@@ -17,13 +17,13 @@ import { findUnaccounted } from '../retry-publisher.js';
 const INGEST = 'http://localhost:3100';
 // Off the defaults (9100-9102) so the test can't collide with locally running services.
 const METRICS_PORTS = { 'ingest-api.js': 9190, 'consumer.js': 9191, 'delivery-worker.js': 9192 };
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd', 'pipe_lease', 'pipe_lost'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd', 'pipe_lease', 'pipe_lost', 'pipe_gone', 'pipe_throttle', 'pipe_backlog', 'pipe_drain', 'pipe_sluggish'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
 const stdout = {};       // file -> everything the child printed
-const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true };
+const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true, throttleLeft: 2, backlogDown: true };
 const herd = { inflight: 0, max: 0 }; // concurrent requests at /herd
 const lease = { gate: null, arrived: null }; // /lease holds its response until the test says so
 const children = [];
@@ -87,20 +87,25 @@ before(async () => {
     if (path === '/picky' && event.payload.bad && behaviour.pickyRejectsBad) status = 422; // rejects one kind of event, accepts the rest
     if (path === '/burst' && behaviour.burstFailuresLeft > 0) { behaviour.burstFailuresLeft--; status = 503; }
     if (path === '/never') status = 500;
+    if (path === '/gone') status = 410;
+    if (path === '/backlog' && behaviour.backlogDown) status = 500;
+    const headers = {};
+    if (path === '/throttle' && behaviour.throttleLeft > 0) { behaviour.throttleLeft--; status = 429; headers['Retry-After'] = '2'; }
     if (path === '/lease') { lease.arrived?.(); await lease.gate; }
+    if (path === '/sluggish') await sleep(300); // healthy, but slow to answer
     if (path === '/herd') { // a just-recovered endpoint: count how many requests overlap
       herd.max = Math.max(herd.max, ++herd.inflight);
       await sleep(30);
       herd.inflight--;
     }
-    received.push({ path, eventId: event.event_id, type: event.type, verified, status });
-    res.writeHead(status); res.end();
+    received.push({ path, eventId: event.event_id, type: event.type, verified, status, at: Date.now() });
+    res.writeHead(status, headers); res.end();
   });
   await new Promise((r) => receiver.listen(0, r));
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd'], ['pipe_lease', '/lease'], ['pipe_lost', '/lost']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd'], ['pipe_lease', '/lease'], ['pipe_lost', '/lost'], ['pipe_gone', '/gone'], ['pipe_throttle', '/throttle'], ['pipe_backlog', '/backlog'], ['pipe_drain', '/drain'], ['pipe_sluggish', '/sluggish']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -220,9 +225,15 @@ test('exhausted retries -> dead letter -> replay after the endpoint recovers', a
 
 test('circuit breaker opens after 5 consecutive failures and stops hitting the endpoint', async () => {
   behaviour.downIsDown = true;
-  // Each dead letter costs 3 failures; two events = 6 >= threshold of 5.
-  for (let i = 0; i < 3; i++) await ingest('pipe_down');
-  await waitFor(async () => (await (await redis()).get(`cb:${endpoints.pipe_down}`))?.includes('"open"'), 'breaker open');
+  // An event costs 4 failures (inline, 2 retries, the ping before giving up), and its dead
+  // letter takes whatever is queued behind it along. So feed events one at a time: two
+  // events = 8 >= threshold of 5.
+  await waitFor(async () => {
+    if ((await (await redis()).get(`cb:${endpoints.pipe_down}`))?.includes('"open"')) return true;
+    const { rowCount } = await pool.query(`SELECT 1 FROM delivery_attempts WHERE endpoint_id = $1 AND status = 'pending'`, [endpoints.pipe_down]);
+    if (!rowCount) await ingest('pipe_down');
+    return false;
+  }, 'breaker open');
 
   const before = hits('/down');
   await ingest('pipe_down');
@@ -272,6 +283,57 @@ test("a tenant's own retry schedule replaces the global one", async () => {
   const { event_id } = (await ingest('pipe_custom')).body;
   const dead = await waitFor(async () => (await dash('pipe_custom', 'GET', '/api/dlq')).body.find((d) => d.event_id === event_id), 'dead letter');
   assert.deepEqual([dead.dead_reason, dead.attempt_count], ['delivery_exhausted', 2]); // inline + 1 retry
+});
+
+test('410 Gone disables the endpoint and dead-letters its queue; an owner turns it back on', async () => {
+  const first = (await ingest('pipe_gone')).body.event_id;
+  const second = (await ingest('pipe_gone')).body.event_id;
+  const rows = await waitFor(async () => {
+    const r = await pool.query('SELECT event_id, status, dead_reason FROM delivery_attempts WHERE endpoint_id = $1 ORDER BY id', [endpoints.pipe_gone]);
+    return r.rows.length === 2 && r.rows.every((x) => x.status === 'dead') && r.rows;
+  }, 'both dead-lettered');
+  assert.deepEqual(rows.map((r) => [r.event_id, r.dead_reason]), [[first, 'endpoint_gone'], [second, 'endpoint_gone']]);
+  assert.equal(received.filter((r) => r.path === '/gone' && r.eventId === second).length, 0, 'queued event was sent to a gone endpoint');
+
+  const ep = (await dash('pipe_gone', 'GET', '/api/endpoints')).body[0];
+  assert.deepEqual([ep.is_active, ep.disabled_reason], [false, 'http_410']);
+  const before = hits('/gone');
+  await ingest('pipe_gone');
+  await sleep(2000);
+  assert.equal(hits('/gone'), before, 'a disabled endpoint was called');
+
+  const on = await dash('pipe_gone', 'PATCH', `/api/endpoints/${endpoints.pipe_gone}`, { is_active: true });
+  assert.deepEqual([on.body.is_active, on.body.disabled_reason], [true, null]);
+});
+
+test('429 with Retry-After: the next try waits as long as the receiver asked, inline and in the worker', async () => {
+  const { event_id } = (await ingest('pipe_throttle')).body;
+  await waitFor(() => okFor('/throttle', event_id).length, 'delivered after throttling');
+  const tries = received.filter((r) => r.path === '/throttle' && r.eventId === event_id);
+  assert.deepEqual(tries.map((r) => r.status), [429, 429, 200]);
+  // The schedule here is 1s (+-10%); Retry-After said 2s.
+  for (let i = 1; i < tries.length; i++) assert.ok(tries[i].at - tries[i - 1].at >= 1900, `try ${i + 1} came ${tries[i].at - tries[i - 1].at}ms after the last`);
+  assert.ok(!received.some((r) => r.path === '/throttle' && r.type === 'reliant.ping'), 'pinged a throttling endpoint');
+});
+
+test('a dead endpoint with a backlog clears it in one retry cycle, not one cycle per event; replay restores it in order', async () => {
+  const ids = [];
+  for (let i = 0; i < 4; i++) ids.push((await ingest('pipe_backlog', { payload: { i } })).body.event_id);
+  const rows = await waitFor(async () => {
+    const r = await pool.query('SELECT event_id, status, dead_reason, attempt_count FROM delivery_attempts WHERE endpoint_id = $1 ORDER BY id', [endpoints.pipe_backlog]);
+    return r.rows.length === 4 && r.rows.every((x) => x.status === 'dead') && r.rows;
+  }, 'backlog dead-lettered');
+  assert.deepEqual(rows.map((r) => [r.event_id, r.dead_reason, r.attempt_count]), [
+    [ids[0], 'delivery_exhausted', 3],
+    ...ids.slice(1).map((id) => [id, 'endpoint_unreachable', 0]),
+  ]);
+  assert.ok(ids.slice(1).every((id) => !received.some((r) => r.eventId === id)), 'a queued event was sent while the head was failing');
+
+  behaviour.backlogDown = false;
+  const replay = await dash('pipe_backlog', 'POST', `/api/endpoints/${endpoints.pipe_backlog}/replay-dead`, {});
+  assert.deepEqual([replay.status, replay.body.requeued], [202, 4]);
+  await waitFor(() => ids.every((id) => okFor('/backlog', id).length), 'backlog delivered after replay');
+  assert.deepEqual(received.filter((r) => r.path === '/backlog' && r.status === 200 && r.type !== 'reliant.ping').map((r) => r.eventId), ids);
 });
 
 // Spec §9.12 / §14: an endpoint that was down for a long time comes back with a big
@@ -365,8 +427,11 @@ test('metrics: each process exposes what the tests above did', async () => {
   const worker = await scrape('delivery-worker.js');
   assert.ok(sum(worker, 'reliant_dead_letters_total{reason="delivery_exhausted"}') >= 1);
   assert.ok(sum(worker, 'reliant_dead_letters_total{reason="payload_rejected"}') >= 1);
+  assert.ok(sum(worker, 'reliant_dead_letters_total{reason="endpoint_unreachable"}') >= 3, 'backlog dead letters counted');
+  assert.equal(sum(worker, 'reliant_endpoints_disabled_total{reason="http_410"}'), 1);
   assert.ok(sum(worker, 'reliant_endpoint_pings_total{result="healthy"}') >= 1);
-  assert.ok(sum(worker, 'reliant_circuit_breaker_transitions_total{from="closed",to="open"}') >= 1);
+  const opened = 'reliant_circuit_breaker_transitions_total{from="closed",to="open"}'; // whichever process saw the 5th failure
+  assert.ok(sum(worker, opened) + sum(consumer, opened) >= 1);
   assert.ok(sum(worker, 'reliant_dlq_depth{reason="delivery_exhausted"}') >= 1, 'gauge read from Postgres');
   assert.match(worker, new RegExp(`reliant_circuit_breaker_open\{endpoint_id="${endpoints.pipe_down}",tenant="pipe_down"\} 1`), 'per-endpoint gauge from Redis');
   assert.ok(value(worker, 'reliant_oldest_pending_seconds') >= 0);

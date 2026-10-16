@@ -1,0 +1,131 @@
+# Reliant on one VM, public over HTTPS. See deploy/README.md.
+#   cd deploy && cp .env.example .env   # fill it in
+#   docker compose up -d --build
+#
+# Only Caddy publishes ports (80, 443). Postgres, Redis, Redpanda and every /metrics port
+# stay on the internal network.
+
+x-app: &app
+  build: ..
+  image: reliant:live
+  restart: unless-stopped
+  environment: &app-env
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_USER: reliant
+    DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    DB_NAME: reliant
+    KAFKA_BROKER: redpanda:9092
+    REDIS_URL: redis://redis:6379
+    SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:?set SECRET_ENCRYPTION_KEY in deploy/.env}
+    INGEST_TOKEN: ${INGEST_TOKEN:?set INGEST_TOKEN in deploy/.env}
+    # Public-exposure settings. Spelled out so nobody flips them by accident:
+    ALLOW_PRIVATE_ENDPOINTS: "false" # SSRF guard on: endpoints can't point at this VM's internal network
+    COOKIE_SECURE: "true"            # session cookie only over HTTPS
+    TRUST_PROXY: "true"              # client IP from Caddy's X-Forwarded-For (login rate limits)
+    RETRY_FAST_MODE: "false"
+    RATE_LIMIT_PER_SEC: ${RATE_LIMIT_PER_SEC:-50}
+    RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-100}
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reliant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: reliant
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reliant -d reliant"]
+      interval: 3s
+      retries: 30
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 30
+
+  redpanda:
+    image: redpandadata/redpanda:v26.2.2
+    restart: unless-stopped
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 1G
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+      # write caching off (an ack means on disk), no enterprise features
+      - ../k8s/local/redpanda-bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 3s
+      retries: 40
+
+  # Schema + topics, then exits. Every app service waits for it. No DEV_SEED here: the dev
+  # tenants' API keys are public. Make tenants with create-tenant (README).
+  migrate:
+    <<: *app
+    restart: on-failure
+    command: ["node", "migrate.js"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ingest:
+    <<: *app
+    command: ["node", "ingest-api.js"]
+  consumer:
+    <<: *app
+    command: ["node", "consumer.js"]
+  worker:
+    <<: *app
+    command: ["node", "delivery-worker.js"]
+  retry-publisher:
+    <<: *app
+    command: ["node", "retry-publisher.js"]
+  dashboard:
+    <<: *app
+    command: ["node", "dashboard-api.js"]
+
+  caddy:
+    image: caddy:2.8.4
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates: keep them, or Let's Encrypt rate-limits re-issuing
+      - caddy_config:/config
+    depends_on: [ingest, dashboard]
+
+  # Demo receiver: the Python SDK's example, verifying signatures and deduplicating.
+  # Opt-in, because it needs the endpoint's secret first (README, step 5):
+  #   docker compose --profile demo up -d receiver
+  receiver:
+    image: python:3.12.7-slim
+    profiles: [demo]
+    restart: unless-stopped
+    working_dir: /sdk
+    command: ["python", "examples/receiver.py"]
+    environment:
+      RELIANT_WEBHOOK_SECRETS: ${RELIANT_WEBHOOK_SECRETS:-}
+      PORT: "8080"
+    volumes: ["../sdk/python:/sdk:ro"]
+
+volumes:
+  pgdata:
+  redpanda:
+  caddy_data:
+  caddy_config:

@@ -27,3 +27,14 @@ export function validateRetrySchedule(schedule) {
   if (!schedule.every((m) => Number.isInteger(m) && m >= 1 && m <= 1440)) return 'each delay must be a whole number of minutes from 1 to 1440';
   return null;
 }
+
+// A 429 or 503's Retry-After (delay in seconds, or an HTTP date) in ms, or null when it's
+// missing or unreadable. Capped at a day, the longest delay a tenant's own schedule allows.
+export const MAX_RETRY_AFTER_MS = 24 * 3600_000;
+export function parseRetryAfter(value, now = Date.now()) {
+  if (value == null) return null;
+  const v = String(value).trim(); // an HTTP date ends in GMT; unchecked, Date.parse('-5') is a year
+  const ms = /^\d+$/.test(v) ? Number(v) * 1000 : /GMT$/.test(v) ? Date.parse(v) - now : NaN;
+  if (!Number.isFinite(ms)) return null;
+  return Math.min(Math.max(ms, 0), MAX_RETRY_AFTER_MS);
+}

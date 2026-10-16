@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { nextRetryDelay, validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './backoff.js';
+import { nextRetryDelay, validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES, parseRetryAfter, MAX_RETRY_AFTER_MS } from './backoff.js';
 import * as cb from './circuit-breaker.js';
 import * as sig from './signing.js';
 import { validateEvent, validateEventTypes } from './event.js';
@@ -141,4 +141,14 @@ test('password: policy is length-based and rejects the email name', () => {
   assert.match(passwordProblem('x'.repeat(201)), /at most 200/);
   assert.match(passwordProblem('alice-password-1', 'alice@example.com'), /email name/);
   assert.match(passwordProblem(12345678901234), /string/);
+});
+
+test('Retry-After: seconds or HTTP date, capped at a day, junk ignored', () => {
+  const now = Date.parse('2026-01-01T00:00:00Z');
+  assert.equal(parseRetryAfter('120', now), 120_000);
+  assert.equal(parseRetryAfter(' 0 ', now), 0);
+  assert.equal(parseRetryAfter('Thu, 01 Jan 2026 00:01:30 GMT', now), 90_000);
+  assert.equal(parseRetryAfter('Wed, 31 Dec 2025 23:00:00 GMT', now), 0, 'a date in the past means now');
+  assert.equal(parseRetryAfter('999999999', now), MAX_RETRY_AFTER_MS);
+  for (const junk of [undefined, null, '', 'soon', '-5', '1.5']) assert.equal(parseRetryAfter(junk, now), null, String(junk));
 });

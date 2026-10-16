@@ -12,4 +12,5 @@ One file per decision: what was decided, why, and what it costs. Numbers follow 
 | [006](0006-autoscaling.md) | Autoscale consumer on Kafka lag and worker on due retry work (KEDA), not CPU or a fixed pool | Accepted |
 | [007](0007-endpoint-isolation.md) | Endpoint isolation: bounded inline attempt + hand-off to a separate retry queue | Accepted |
 | [008](0008-ordering-guarantee.md) | Ordering: completion-order per endpoint, with a ping to set aside an event a healthy endpoint keeps rejecting | Accepted |
+| [009](0009-status-codes-and-dead-endpoint-backlogs.md) | Honour 429/503 `Retry-After`; 410 disables the endpoint; a dead endpoint's backlog goes to the DLQ with its head | Accepted |
 

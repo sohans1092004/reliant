@@ -177,6 +177,9 @@ The changes since §4's ~1,500/s: 12 partitions instead of 3 (more consumers can
 
 ## Not yet tested
 
+The second round of failure drills (partition, KEDA under load, rolling restart at 1,000/s, Redis down with a hanging endpoint, lease double-send) is in [`drills.md`](drills.md).
+
+
 - Delivery latency at higher rates and with slow-but-answering endpoints (spec §14 row 2)
 - Worker-pool scaling (more `delivery-worker.js` processes) and ledger write throughput under retry load (§14 rows 3 and 7)
 - Thundering herd is covered by an integration test instead (`tests/pipeline.test.js`): 3 workers, half-open breaker, 40-event backlog; the endpoint saw at most 1 request at a time, in order

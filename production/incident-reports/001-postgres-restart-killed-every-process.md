@@ -84,7 +84,7 @@ process exits: none
 - [x] **Drills for Redis and Redpanda:** both found real bugs, see [002](002-redis-outage-stalled-ingest.md) and [003](003-redpanda-outage-hung-ingest.md).
 - [x] **Drill against the Kubernetes deployment:** see below.
 
-## Kubernetes re-run (`bash loadtest/k8s-pg-outage.sh`)
+## Kubernetes re-run (`bash loadtest/k8s-drill.sh pg-outage`)
 
 Postgres is crash-stopped inside its pod (`pg_ctl stop -m immediate`, then Kubernetes restarts the container; the emptyDir data survives that, but wouldn't survive a pod deletion). Crashes show up as pod restart counts.
 

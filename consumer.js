@@ -144,10 +144,13 @@ async function processChunk(messages, partition, heartbeat) {
       outcomes.get(endpoint.endpoint_id).push({ ok: result.ok, at: Date.now() });
       if (!result.ok) {
         blocked = true;
-        // Timed out = maybe just slow: worker retries now with a longer timeout. Any
-        // other failure is a real one and backs off per the retry policy.
+        // Timed out = maybe just slow: worker retries now with a longer timeout. 410 Gone:
+        // the worker disables the endpoint on its next try, so that's now too. A 429/503
+        // with Retry-After waits as asked. Any other failure backs off per the retry policy.
+        const delayMs = result.timedOut || result.httpStatus === 410 ? 0
+          : result.retryAfterMs ?? nextRetryDelay(1, retryPolicyFor(endpoint.retry_schedule_minutes));
         queue.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, attempt_count: 1,
-          delay_ms: result.timedOut ? 0 : nextRetryDelay(1, retryPolicyFor(endpoint.retry_schedule_minutes)), error: result.error, http_status: result.httpStatus });
+          delay_ms: delayMs, error: result.error, http_status: result.httpStatus });
         log.info("inline attempt failed, queued for retry", {
           event_id: event.event_id, endpoint_id: endpoint.endpoint_id, tenant_id: event.tenant_id,
           error: result.error, http_status: result.httpStatus, retry_now: !!result.timedOut,
