@@ -6,6 +6,13 @@ datasources:
     access: proxy
     url: http://reliant_prometheus:9090
     isDefault: true
+  # The in-cluster Prometheus (kubectl apply -k observability). Reachable once Grafana is on the
+  # cluster's Docker network: see observability/compose.k8s.yaml.
+  - name: Prometheus (Kubernetes)
+    uid: prometheus-k8s
+    type: prometheus
+    access: proxy
+    url: http://desktop-control-plane:30090
   - name: Jaeger
     uid: jaeger
     type: jaeger

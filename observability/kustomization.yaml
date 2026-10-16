@@ -1,0 +1,15 @@
+# Prometheus for the local Kubernetes deployment (k8s/local), with the same alert rules as
+# the local docker compose Prometheus. It lives here, not under k8s/, because kustomize only
+# reads files inside its own directory, and alerts.yml has to stay one file.
+#   kubectl apply -k observability
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: reliant
+resources:
+  - k8s/prometheus.yaml
+
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=k8s/prometheus.yml
+      - alerts.yml

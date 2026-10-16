@@ -63,6 +63,24 @@ Limits:
 
 Caddy takes the visitor's IP from Cloudflare's `Cf-Connecting-IP` header, but only for requests from a private address (the tunnel container). So per-IP login limits still see real visitors, and a direct client on a VM can't fake the header.
 
+## Monitoring
+
+`compose.monitoring.yaml` adds Prometheus and Grafana, with the same alert rules (`observability/alerts.yml`) and the same *Reliant overview* dashboard as local development.
+
+```bash
+# add to deploy/.env:  GRAFANA_ADMIN_PASSWORD=<openssl rand -base64 18>
+docker compose -f compose.yaml [-f compose.tunnel.yaml] -f compose.monitoring.yaml up -d --wait
+```
+
+- **Prometheus** scrapes each process's internal `/metrics` port over the compose network, keeping 15 days.
+- **Grafana** listens on `127.0.0.1:3003` only, never through Caddy or the tunnel, and requires the admin password. Anonymous access and sign-up are off.
+- **From another machine**, use an SSH tunnel:
+  ```bash
+  ssh -L 3003:127.0.0.1:3003 <vm>
+  ```
+  then open http://localhost:3003.
+- **Alerts** are evaluated and shown in Prometheus and Grafana. Nothing sends them anywhere yet; that would need an Alertmanager with a destination such as email or Slack.
+
 ## What's exposed, and what isn't
 
 | Path | Goes to | Who uses it |

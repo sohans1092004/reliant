@@ -1,0 +1,88 @@
+# Prometheus for the Reliant pods in the cluster. Apply with: kubectl apply -k observability
+# Browse it: kubectl -n reliant port-forward svc/prometheus 9091:9090, then http://localhost:9091.
+# In the local Grafana: observability/compose.k8s.yaml, then pick "Prometheus (Kubernetes)".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  labels: { app.kubernetes.io/name: reliant-monitoring }
+---
+# Read-only, and only this namespace: list the pods to scrape. Nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  labels: { app.kubernetes.io/name: reliant-monitoring }
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  labels: { app.kubernetes.io/name: reliant-monitoring }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: prometheus }
+subjects:
+  - { kind: ServiceAccount, name: prometheus }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels: { app.kubernetes.io/name: reliant-monitoring, app.kubernetes.io/component: prometheus }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/component: prometheus }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: reliant-monitoring, app.kubernetes.io/component: prometheus }
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534 # nobody, the image's own user
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.53.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+          ports:
+            - { name: http, containerPort: 9090 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {} # dev: history goes with the pod
+---
+# NodePort 30090 on the node. Docker Desktop runs the node as a container on the "kind" Docker
+# network, so the port is reachable from that network (observability/compose.k8s.yaml), not localhost.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels: { app.kubernetes.io/name: reliant-monitoring }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/component: prometheus }
+  ports:
+    - { name: http, port: 9090, targetPort: http, nodePort: 30090 }

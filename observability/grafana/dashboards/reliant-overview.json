@@ -20,7 +20,7 @@
       "description": "Accepted events per second (5m average).",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -32,7 +32,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(rate(reliant_ingest_requests_total{status=\"202\"}[5m]))",
           "legendFormat": "__auto",
@@ -81,7 +81,7 @@
       "description": "Share of all delivery attempts (inline + retries) that got a 2xx, last 15 minutes.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 4,
@@ -93,7 +93,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(rate(reliant_delivery_attempts_total{outcome=\"delivered\"}[15m])) / sum(rate(reliant_delivery_attempts_total[15m]))",
           "legendFormat": "__auto",
@@ -142,7 +142,7 @@
       "description": "Event accepted -> first delivery attempt started. Target (spec NFR): under 5s.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 8,
@@ -154,7 +154,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.95, sum by (le) (rate(reliant_delivery_latency_seconds_bucket[5m])))",
           "legendFormat": "__auto",
@@ -207,7 +207,7 @@
       "description": "Kafka messages not yet processed, all partitions.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 12,
@@ -219,7 +219,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(reliant_consumer_lag)",
           "legendFormat": "__auto",
@@ -276,7 +276,7 @@
       "description": "Deliveries currently in the DLQ (all reasons).",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 16,
@@ -288,7 +288,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(reliant_dlq_depth)",
           "legendFormat": "__auto",
@@ -337,7 +337,7 @@
       "description": "Endpoints Reliant is currently not calling.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 20,
@@ -349,7 +349,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "count(reliant_circuit_breaker_open) or vector(0)",
           "legendFormat": "__auto",
@@ -415,7 +415,7 @@
       "description": "Inline and retry attempts per second. timeout = slower than the per-attempt limit (1s inline).",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -427,7 +427,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (outcome) (rate(reliant_delivery_attempts_total[5m]))",
           "legendFormat": "{{outcome}}",
@@ -532,7 +532,7 @@
       "description": "Dashed line: the 5s p95 target.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 12,
@@ -544,7 +544,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.5, sum by (le) (rate(reliant_delivery_latency_seconds_bucket[5m])))",
           "legendFormat": "p50",
@@ -553,7 +553,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.95, sum by (le) (rate(reliant_delivery_latency_seconds_bucket[5m])))",
           "legendFormat": "p95",
@@ -562,7 +562,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.99, sum by (le) (rate(reliant_delivery_latency_seconds_bucket[5m])))",
           "legendFormat": "p99",
@@ -671,7 +671,7 @@
       "description": "202 accepted, 200 duplicate, 400 invalid, 401 bad token, 429 rate-limited, 503 saved but not yet on Kafka.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -683,7 +683,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (status) (rate(reliant_ingest_requests_total[5m]))",
           "legendFormat": "{{status}}",
@@ -833,7 +833,7 @@
       "description": "Last 15 minutes. Low numbers usually mean the tenant's endpoint is struggling, not Reliant.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 12,
@@ -845,7 +845,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (tenant) (rate(reliant_delivery_attempts_total{outcome=\"delivered\"}[15m])) / sum by (tenant) (rate(reliant_delivery_attempts_total[15m]))",
           "legendFormat": "__auto",
@@ -906,7 +906,7 @@
       "description": "Total across partitions. Rising while ingest is steady = the consumer is not keeping up.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -918,7 +918,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(reliant_consumer_lag)",
           "legendFormat": "lag",
@@ -978,7 +978,7 @@
       "description": "",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 8,
@@ -990,7 +990,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "reliant_pending_deliveries",
           "legendFormat": "pending",
@@ -1050,7 +1050,7 @@
       "description": "The default retry schedule spans ~14.6h; much older means the queue is stuck.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 16,
@@ -1062,7 +1062,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "reliant_oldest_pending_seconds",
           "legendFormat": "age",
@@ -1119,10 +1119,10 @@
       "id": 16,
       "type": "timeseries",
       "title": "Dead letters by reason",
-      "description": "delivery_exhausted: endpoint down. payload_rejected: endpoint up but refuses that event. processing_error: our bug.",
+      "description": "delivery_exhausted: endpoint down. payload_rejected: endpoint up but refuses that event. processing_error: our bug. endpoint_unreachable: queued behind an event that ran out of retries against a failing endpoint (ADR-009). endpoint_gone: the endpoint answered 410 and was disabled.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -1134,7 +1134,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (reason) (reliant_dlq_depth)",
           "legendFormat": "{{reason}}",
@@ -1217,6 +1217,36 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "endpoint_unreachable"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "endpoint_gone"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
           }
         ]
       },
@@ -1238,7 +1268,7 @@
       "title": "Retry attempts by attempt number (last 1h)",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "description": "How far into the retry schedule deliveries get. Mass at high numbers = endpoints failing for long.",
       "gridPos": {
@@ -1251,7 +1281,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (le) (increase(reliant_retry_attempt_number_bucket[1h]))",
           "legendFormat": "{{le}}",
@@ -1293,7 +1323,7 @@
       "description": "Endpoints Reliant has stopped calling until their cooldown passes.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 16,
@@ -1305,7 +1335,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "reliant_circuit_breaker_open",
           "legendFormat": "__auto",
@@ -1359,10 +1389,10 @@
       "id": 20,
       "type": "timeseries",
       "title": "CPU by process",
-      "description": "1.0 = one full core. The consumer saturates first (see load tests).",
+      "description": "1.0 = one full core. The consumer saturates first (see load tests). Summed over replicas (Kubernetes runs 2 ingest pods).",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 0,
@@ -1374,9 +1404,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "rate(process_cpu_seconds_total{job=\"reliant\"}[1m])",
+          "expr": "sum by (process) (rate(process_cpu_seconds_total{job=\"reliant\"}[1m]))",
           "legendFormat": "{{process}}",
           "refId": "A"
         }
@@ -1506,10 +1536,10 @@
       "id": 21,
       "type": "timeseries",
       "title": "Event-loop lag p99 by process",
-      "description": "How long callbacks wait to run. Rising = the process is CPU-bound.",
+      "description": "How long callbacks wait to run. Rising = the process is CPU-bound. Worst replica per process.",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 8,
@@ -1521,9 +1551,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "nodejs_eventloop_lag_p99_seconds{job=\"reliant\"}",
+          "expr": "max by (process) (nodejs_eventloop_lag_p99_seconds{job=\"reliant\"})",
           "legendFormat": "{{process}}",
           "refId": "A"
         }
@@ -1653,10 +1683,10 @@
       "id": 22,
       "type": "timeseries",
       "title": "Memory (resident) by process",
-      "description": "",
+      "description": "Summed over replicas (Kubernetes runs 2 ingest pods).",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "x": 16,
@@ -1668,9 +1698,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "process_resident_memory_bytes{job=\"reliant\"}",
+          "expr": "sum by (process) (process_resident_memory_bytes{job=\"reliant\"})",
           "legendFormat": "{{process}}",
           "refId": "A"
         }
@@ -1795,10 +1825,327 @@
           "placement": "bottom"
         }
       }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "Fencing and recovery",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Lease lost (per 5m)",
+      "description": "A worker held a row past its 60s lease and another took it over: its outcome was dropped (fenced), and the endpoint may have got a duplicate. Should be 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(reliant_lease_lost_total[5m]))",
+          "legendFormat": "lease lost",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "gradientMode": "none",
+            "axisSoftMin": 0,
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "lease lost"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Unaccounted events and reconciler re-sends",
+      "description": "Unaccounted: events 15-60 min old with a subscribed endpoint but no attempt and no queued delivery (should be 0). Re-sent: what the reconciler put back on Kafka in the last 5m.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(reliant_unaccounted_events)",
+          "legendFormat": "unaccounted",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(reliant_reconciled_events_total[5m]))",
+          "legendFormat": "re-sent (5m)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "gradientMode": "none",
+            "axisSoftMin": 0,
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unaccounted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "re-sent (5m)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Endpoints disabled (per 1h)",
+      "description": "Endpoints Reliant turned off itself, by reason. http_410: the receiver answered 410 Gone (ADR-009). An owner re-enables it in the dashboard and replays its dead letters.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (increase(reliant_endpoints_disabled_total[1h]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "gradientMode": "none",
+            "axisSoftMin": 0,
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "http_410"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     }
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Prometheus",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "skipUrlSync": false
+      }
+    ]
   },
   "annotations": {
     "list": []

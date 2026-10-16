@@ -1,0 +1,13 @@
+# Lets the local Grafana read the in-cluster Prometheus (observability/kustomization.yaml).
+# Docker Desktop's Kubernetes node is itself a container, "desktop-control-plane", on a Docker
+# network named "kind"; its NodePorts are reachable there, not on localhost. Opt-in because
+# Compose refuses to start when an external network is missing (no cluster running).
+#   docker compose -f docker-compose.yml -f observability/compose.k8s.yaml --profile observability up -d reliant_grafana
+# Then pick "Prometheus (Kubernetes)" in the dashboard's Prometheus menu.
+services:
+  reliant_grafana:
+    networks: [default, kind]
+
+networks:
+  kind:
+    external: true

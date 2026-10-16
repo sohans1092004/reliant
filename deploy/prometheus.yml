@@ -1,0 +1,22 @@
+# Prometheus for the live stack (compose.monitoring.yaml). Scrapes each process's internal
+# /metrics port over the compose network; none of those ports is published.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml # the same rules as everywhere else (../observability/alerts.yml)
+
+scrape_configs:
+  - job_name: reliant # alerts and dashboards select job="reliant"
+    static_configs:
+      - targets: ['ingest:9100']
+        labels: { process: ingest }
+      - targets: ['consumer:9101']
+        labels: { process: consumer }
+      - targets: ['worker:9102']
+        labels: { process: worker }
+      - targets: ['dashboard:9103']
+        labels: { process: dashboard }
+      - targets: ['retry-publisher:9104']
+        labels: { process: retry-publisher }
