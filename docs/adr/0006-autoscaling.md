@@ -20,7 +20,7 @@ Use [KEDA](https://keda.sh) ScaledObjects (`k8s/local/autoscaling/`), each drivi
 | `worker` | Endpoints with retry work due now: `count(DISTINCT endpoint_id) ... status='pending' AND next_retry_at <= NOW()` | 50 endpoints | 1 – 10 |
 | `ingest` | Not autoscaled locally (fixed 2) | – | – |
 
-- **Worker counts endpoints, not rows.** A worker handles one row per endpoint per sweep (ADR-008 ordering), so 10,000 due rows for one endpoint can't use a second worker, while 10,000 endpoints with one due row each can.
+- **Worker counts endpoints, not rows.** Only one worker at a time works on an endpoint, one request at a time (ADR-008 ordering), so 10,000 due rows for one endpoint can't use a second worker, while 10,000 endpoints with one due row each can.
 - **Scale down only after 2 quiet minutes** (`horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds: 120`), because every consumer scale event triggers a Kafka group rebalance that briefly pauses consumption.
 - **Ingest is stateless and CPU-bound**, so plain CPU-based HPA fits it. It needs metrics-server, which the local Docker Desktop cluster doesn't run, so ingest uses a fixed replica count locally; the AWS overlay should add a CPU HPA.
 - **The consumer and worker Deployments have no `replicas` field**, so `kubectl apply` doesn't fight the autoscaler.

@@ -10,6 +10,7 @@
 //   node loadtest/run.js redis-hang  Redis down while every tenant also has a hanging endpoint
 //   node loadtest/run.js lease-double-send  freeze a worker mid-POST past its lease
 //   node loadtest/run.js consumer-partition  cut one consumer off the broker; the process keeps running
+//   node loadtest/run.js retry-drain  how fast one worker drains a queued backlog over many endpoints
 //   LT_TARGET=k8s: k8s-scale-out (KEDA under live load), k8s-rolling-restart (consumers, 1,000/s)
 // Needs docker compose up and NO other ingest/consumer/worker running.
 // Uses its own lt_* tenants and deletes everything it created at the end.
@@ -812,6 +813,39 @@ async function consumerPartition() {
   }
 }
 
+// The retry lane's throughput, measured alone (docs/drills.md §5: endpoints pushed into it by
+// a rebalance stayed behind because it drained slower than they received). LT_ENDPOINTS
+// endpoints with LT_ROWS queued deliveries each, healthy receiver, LT_WORKERS workers.
+// An endpoint recovers only if its drain rate here beats its inflow.
+async function retryDrain() {
+  const E = Number(process.env.LT_ENDPOINTS || 100), K = Number(process.env.LT_ROWS || 100), W = Number(process.env.LT_WORKERS || 1);
+  const tenants = await setupTenants(E, ['/ok']);
+  const { rows: eps } = await pool.query('SELECT endpoint_id, tenant_id FROM endpoints WHERE tenant_id = ANY($1)', [tenants]);
+  const ids = [], epOf = [], tOf = [];
+  for (let k = 0; k < K; k++) for (const ep of eps) { ids.push(crypto.randomUUID()); epOf.push(ep.endpoint_id); tOf.push(ep.tenant_id); }
+  await pool.query(`INSERT INTO events (event_id, tenant_id, type, payload, created_at)
+    SELECT id, t, 'drain.bench', '{}', NOW() FROM unnest($1::uuid[], $2::text[]) AS x(id, t)`, [ids, tOf]);
+  received.clear();
+  await pool.query(`INSERT INTO delivery_attempts (event_id, endpoint_id, attempt_count, next_retry_at)
+    SELECT id, ep, 0, NOW() FROM unnest($1::uuid[], $2::uuid[]) WITH ORDINALITY AS x(id, ep, n) ORDER BY n`, [ids, epOf]);
+  const t0 = Date.now();
+  for (let i = 0; i < W; i++) start(`worker-${i}`, 'delivery-worker.js', { RETRY_FAST_MODE: 'true', METRICS_PORT: '0', WORKER_POLL_MS: '200' });
+  const ticker = setInterval(() => console.log(`t+${((Date.now() - t0) / 1000).toFixed(0)}s delivered ${received.size}/${ids.length}`), 5000);
+  await waitFor(async () => received.size >= ids.length, 'backlog drained', 600_000);
+  clearInterval(ticker);
+  const secs = (Date.now() - t0) / 1000;
+  // Order check: per endpoint, arrival order must match queue order.
+  const pos = new Map([...firstAt.keys()].map((id, i) => [id, i]));
+  let inversions = 0;
+  for (const ep of eps) {
+    const seq = ids.filter((_, i) => epOf[i] === ep.endpoint_id).map((id) => pos.get(id));
+    for (let i = 1; i < seq.length; i++) if (seq[i] < seq[i - 1]) inversions++;
+  }
+  console.log(`\n--- result ---\n${ids.length} queued deliveries (${E} endpoints x ${K}), ${W} worker(s): drained in ${secs.toFixed(1)}s`
+    + ` = ${(ids.length / secs).toFixed(0)}/s overall, ${(K / secs).toFixed(1)}/s per endpoint; order inversions ${inversions}; `
+    + `duplicates ${[...received.values()].filter((n) => n > 1).length}`);
+}
+
 // ---------- Kubernetes drills (bash loadtest/k8s-drill.sh <name>) ----------
 
 const kubectl = (...args) => execFileSync('kubectl', ['-n', 'reliant', ...args], { stdio: 'pipe' }).toString().trim();
@@ -1031,7 +1065,7 @@ if (!isMainThread) { // a load-generator thread started by threadedLoop
 const scenarios = { ingest: ingestRamp, isolation, recovery, 
   dashboard, 'recovery-spec': recoveryBenchmark, 'consumer-freeze': consumerFreeze, 'pg-outage': () => outage('postgres'), 'redis-outage': () => outage('redis'), 'kafka-outage': () => outage('redpanda'),
   'redis-hang': () => outage('redis', { paths: ['/ok', '/hang'] }), 'lease-double-send': leaseDoubleSend,
-  'consumer-partition': consumerPartition, 'k8s-scale-out': k8sScaleOut, 'k8s-rolling-restart': k8sRollingRestart };
+  'consumer-partition': consumerPartition, 'k8s-scale-out': k8sScaleOut, 'k8s-rolling-restart': k8sRollingRestart, 'retry-drain': retryDrain };
 const name = process.argv[2];
 if (!scenarios[name]) {
   console.log(`usage: node loadtest/run.js ${Object.keys(scenarios).join('|')}`);

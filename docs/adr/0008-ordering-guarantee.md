@@ -9,7 +9,7 @@ The spec (v2 ADR-008) commits to **initiation-order**: delivery attempts *start*
 The code, built on Day 2, does **completion-order per endpoint**:
 
 - `consumer.js`: if the endpoint has any `pending` row, a new event is queued behind it without an inline attempt.
-- `delivery-worker.js`: `DISTINCT ON (endpoint_id) ... ORDER BY created_at` only offers each endpoint's oldest pending row.
+- `delivery-worker.js`: only works on an endpoint from its oldest pending row, one request at a time (ADR-002).
 
 With the default schedule (1m, 5m, 30m, 2h, 12h), an event that keeps failing held the head of its endpoint's queue for about **14.6 hours**. That's harmless when the whole endpoint is down, because nothing would get through anyway. It's harmful when the endpoint is fine and rejects **just this one event**: a malformed payload, or a handler bug for one specific record. Then one bad event stalls all of that endpoint's traffic.
 

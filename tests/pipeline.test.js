@@ -17,13 +17,13 @@ import { findUnaccounted } from '../retry-publisher.js';
 const INGEST = 'http://localhost:3100';
 // Off the defaults (9100-9102) so the test can't collide with locally running services.
 const METRICS_PORTS = { 'ingest-api.js': 9190, 'consumer.js': 9191, 'delivery-worker.js': 9192 };
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd', 'pipe_lease', 'pipe_lost', 'pipe_gone', 'pipe_throttle', 'pipe_backlog', 'pipe_drain', 'pipe_sluggish'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd', 'pipe_lease', 'pipe_lost', 'pipe_gone', 'pipe_throttle', 'pipe_backlog', 'pipe_drain', 'pipe_sluggish', 'pipe_midfail'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
 const stdout = {};       // file -> everything the child printed
-const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true, throttleLeft: 2, backlogDown: true };
+const behaviour = { midfailId: null, flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true, throttleLeft: 2, backlogDown: true };
 const herd = { inflight: 0, max: 0 }; // concurrent requests at /herd
 const lease = { gate: null, arrived: null }; // /lease holds its response until the test says so
 const children = [];
@@ -93,6 +93,7 @@ before(async () => {
     if (path === '/throttle' && behaviour.throttleLeft > 0) { behaviour.throttleLeft--; status = 429; headers['Retry-After'] = '2'; }
     if (path === '/lease') { lease.arrived?.(); await lease.gate; }
     if (path === '/sluggish') await sleep(300); // healthy, but slow to answer
+    if (path === '/midfail' && JSON.parse(body).event_id === behaviour.midfailId) { behaviour.midfailId = null; status = 503; }
     if (path === '/herd') { // a just-recovered endpoint: count how many requests overlap
       herd.max = Math.max(herd.max, ++herd.inflight);
       await sleep(30);
@@ -105,7 +106,7 @@ before(async () => {
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd'], ['pipe_lease', '/lease'], ['pipe_lost', '/lost'], ['pipe_gone', '/gone'], ['pipe_throttle', '/throttle'], ['pipe_backlog', '/backlog'], ['pipe_drain', '/drain'], ['pipe_sluggish', '/sluggish']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd'], ['pipe_lease', '/lease'], ['pipe_lost', '/lost'], ['pipe_gone', '/gone'], ['pipe_throttle', '/throttle'], ['pipe_backlog', '/backlog'], ['pipe_drain', '/drain'], ['pipe_sluggish', '/sluggish'], ['pipe_midfail', '/midfail']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
@@ -361,6 +362,43 @@ test('thundering herd: a recovered endpoint with a 40-event backlog gets one req
   assert.equal(herd.max, 1, `${herd.max} requests hit the recovering endpoint at once`);
   assert.deepEqual(received.filter((r) => r.path === '/herd').map((r) => r.eventId), ids, 'not delivered in order');
   assert.equal(JSON.parse(await (await redis()).get(`cb:${endpoints.pipe_herd}`)).state, 'closed');
+});
+
+// Queued rows straight into the retry lane, in order (as the consumer queues them).
+async function queueBacklog(tenant, ids) {
+  await pool.query(`INSERT INTO events (event_id, tenant_id, type, payload, created_at)
+    SELECT id, $2, 'order.created', '{}', NOW() FROM unnest($1::uuid[]) AS id`, [ids, tenant]);
+  await pool.query(`INSERT INTO delivery_attempts (event_id, endpoint_id, attempt_count, next_retry_at)
+    SELECT id, $2, 0, NOW() FROM unnest($1::uuid[]) WITH ORDINALITY AS t(id, n) ORDER BY n`, [ids, endpoints[tenant]]);
+  return ids;
+}
+const uuids = (n) => Array.from({ length: n }, () => crypto.randomUUID());
+
+// Drill finding (docs/drills.md §5): the retry lane drained a backlog at about one row per
+// endpoint per sweep, and every sweep waited for its slowest endpoint.
+test('a backlogged endpoint drains in batches, not held back by a slow endpoint with a backlog of its own', async () => {
+  const started = Date.now();
+  await queueBacklog('pipe_sluggish', uuids(30)); // 300ms per request: 9s of work
+  const ids = await queueBacklog('pipe_drain', uuids(100));
+  await waitFor(() => ids.every((id) => okFor('/drain', id).length), '100-event backlog delivered', 30_000);
+  const took = Date.now() - started;
+  assert.ok(took < 5000, `100-event backlog took ${took}ms`); // one row per sweep behind /sluggish: 30s or more
+  assert.deepEqual(received.filter((r) => r.path === '/drain').map((r) => r.eventId), ids, 'not delivered in order');
+  await waitFor(async () => (await pool.query(`SELECT count(*)::int AS n FROM delivery_attempts WHERE event_id = ANY($1::uuid[]) AND status = 'delivered'`, [ids])).rows[0].n === 100,
+    'all 100 rows marked delivered');
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM delivery_ledger WHERE event_id = ANY($1::uuid[]) AND status = 'delivered'`, [ids])).rows[0].n, 100,
+    'one ledger row per delivery');
+});
+
+test('a failure in the middle of a batch: nothing after it is sent until it succeeds, and the rest is handed back at once', async () => {
+  const batch = uuids(6);
+  behaviour.midfailId = batch[2];
+  await queueBacklog('pipe_midfail', batch);
+  // The retry after a 503 comes ~1s later (test schedule): far inside the 60s lease the rows
+  // behind it were claimed with, so delivering them this fast means they were handed back.
+  await waitFor(() => batch.every((id) => okFor('/midfail', id).length), 'batch delivered', 15_000);
+  const seen = received.filter((r) => r.path === '/midfail' && r.type !== 'reliant.ping').map((r) => [batch.indexOf(r.eventId), r.status]);
+  assert.deepEqual(seen, [[0, 200], [1, 200], [2, 503], [2, 200], [3, 200], [4, 200], [5, 200]]);
 });
 
 // A worker that stalls past its 60s lease (GC pause, Postgres stall) while another worker

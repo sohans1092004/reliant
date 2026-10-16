@@ -8,7 +8,7 @@ Five drills the review asked for, each run once on one Windows machine (Docker D
 | Worker frozen mid-POST past its lease | `LT_SINK_HOST=host.docker.internal npm run loadtest -- lease-double-send` | 0 of 20 | 20 (expected) | n/a | holds; one ledger inaccuracy |
 | Network partition: one consumer cut off the broker, process still running | `LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-partition` | 0 of 3,956 | 1 | 0 | holds |
 | KEDA scale-out under live load | `bash loadtest/k8s-drill.sh k8s-scale-out` | 0 of 18,376 | 0 | 0 | holds |
-| Rolling consumer restart at 1,000 events/s | `bash loadtest/k8s-drill.sh k8s-rolling-restart` | 0 of 89,881 | 216 | 0 | holds; latency doesn't recover quickly |
+| Rolling consumer restart at 1,000 events/s | `bash loadtest/k8s-drill.sh k8s-rolling-restart` | 0 of ~90,000 | 93–809 | 0 | holds; slow recovery found and fixed |
 
 "Lost" means accepted with a 202 but never received by the test receiver. "Order inversions" compares, per endpoint, the order of first deliveries with the order ingest accepted the events.
 
@@ -89,19 +89,31 @@ Five drills the review asked for, each run once on one Windows machine (Docker D
   - After it, p95 was 10–13s for the rest of the load, while p50 stayed under 130ms.
   - 18,573 events went through the retry queue with no error. They had been queued behind others, or the endpoint ran out of its per-chunk time budget.
 
-**Finding: the retry lane is slow to give back an endpoint that a rebalance pushed into it.** Every endpoint stays in order, so each one takes at most about 1/round-trip events per second. Measured round trips were p50 8–11ms, p95 40–46ms.
+**Finding, fixed: the retry lane was too slow to give an endpoint back.**
+- Every endpoint stays in order, so the retry queue drained one row per endpoint per sweep.
+- Every sweep waited for its slowest endpoint, and each row cost two Postgres writes through a 10-connection pool.
+- `npm run loadtest -- retry-drain` measures this lane alone: 100 endpoints × 200 queued rows, one worker. It drained **~10 rows/s per endpoint**, no faster than the 10/s each endpoint was receiving, so a backlog never shrank.
+
+**The fix** (ADR-002, "Update"):
+- The worker takes up to 20 rows from the front of an endpoint's queue and sends them one at a time, stopping at the first failure.
+- It records each batch's successes in three writes.
+- It claims more work as soon as any endpoint's batch finishes, instead of waiting for the whole sweep.
+- Same benchmark: **~30 rows/s per endpoint**, across 3 interleaved runs each, with 0 order inversions.
+
+**The drill, before and after, alternating images:**
+
+| Worker | p95 for the rest of the load after the restart | Through the retry queue | Lost / inversions |
+|---|---|---|---|
+| Before, run 1 | 11–13s, never recovered | 32,209 | 0 / 0 |
+| Before, run 2 | 30–38s, never recovered | 49,270 | 0 / 0 |
+| After, run 1 | 35–45ms within ~15s | 673 | 0 / 0 |
+| After, run 2 | 100–150ms within ~35s | 18,219 | 0 / 0 |
+
+**Duplicates** were 208, 176, 809 and 93 across those four runs. They come from the consumer rebalance window and varied from 6 to 609 in earlier runs with the old worker. The worker benchmark, which isolates the worker, had 0.
 
 **Measuring order correctly:** order is only checked between requests where one got its 202 before the other was sent. Ingest answers 202 after the Kafka ack, so that one is ahead in Kafka. Comparing `created_at` also counts concurrent requests, which have no order, and reported ~9,000 false inversions.
 
-**Tried and reverted: a per-endpoint drain loop in the worker.** After a success, the worker took the same endpoint's next row at once. A test confirmed it drained a 100-row backlog behind a slow endpoint in under 8s instead of 11s. But in an A/B run of this drill on the same image:
-
-| | Drain loop off | Drain loop on |
-|---|---|---|
-| p50 after the restart | ~150ms | ~24s |
-| p95 after the restart | 30–34s | 38–40s |
-| Duplicates | 6 | 609 |
-
-The likely cause is 100 drain loops competing for Postgres with the consumers. Run-to-run variance on this machine is also large (p95 after the restart ranged from 10s to 34s across clean runs without the change). The open problem stays open.
+**A first attempt was reverted.** Before this fix I tried a per-endpoint loop that claimed and wrote one row at a time. In an A/B run of this drill it made latency worse (p50 ~24s against ~150ms), most likely 100 loops competing for Postgres. Batching the writes is what made the difference.
 
 ## Bugs and lessons from this round
 

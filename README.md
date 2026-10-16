@@ -94,6 +94,7 @@ npm run loadtest -- pg-outage # kill Postgres mid-traffic (docker on PATH); also
 bash loadtest/k8s-drill.sh pg-outage   # the same Postgres drill against the k8s/local deployment (also k8s-scale-out, k8s-rolling-restart)
 LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-freeze  # zombie consumer (needs reliant:dev image)
 npm run loadtest -- redis-hang  # Redis down while every tenant also has a hanging endpoint
+npm run loadtest -- retry-drain # retry-lane throughput: one worker draining 100 endpoints x LT_ROWS queued rows
 LT_SINK_HOST=host.docker.internal npm run loadtest -- lease-double-send   # worker frozen mid-POST past its lease
 LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-partition  # one consumer cut off the broker, still running
 ```
