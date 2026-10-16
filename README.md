@@ -20,6 +20,20 @@ node producer.js              # send a test event (TEST_TENANT_ID=tenant_b for t
 npm run retention             # dry run; --apply archives (archive/*.jsonl.gz) then deletes events > RETENTION_DAYS (35)
 ```
 
+## AWS: KMS and S3 (against LocalStack)
+
+```sh
+docker compose --profile aws up -d    # LocalStack: KMS key alias/reliant-secrets, bucket reliant-archive
+export AWS_ENDPOINT_URL=http://localhost:4566 AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+export KMS_KEY_ID=alias/reliant-secrets ARCHIVE_BUCKET=reliant-archive
+node --test tests/aws.test.js         # CI runs every integration test this way
+```
+
+- **Endpoint secrets, envelope encryption:** with `KMS_KEY_ID` set, each secret is AES-256-GCM-encrypted under its own data key from KMS `GenerateDataKey`, and only the KMS-wrapped copy of that key is stored (`kms1:<wrapped key>:<ciphertext>`). The master key never leaves KMS, and revoking `kms:Decrypt` revokes every secret at once. The data key is bound to an encryption context, so KMS won't unwrap it for any other purpose. Decrypted secrets are cached by ciphertext, so KMS sees one call per secret per process, not per delivery.
+- **Key versioning:** the `kms1:` prefix tells a blob's format. Blobs without it are under `SECRET_ENCRYPTION_KEY`; `npm run migrate` with `KMS_KEY_ID` set re-wraps them (`rewrapSecrets`), and the KMS key itself rotates yearly (`enable-key-rotation`) without re-encrypting anything.
+- **Archives:** with `ARCHIVE_BUCKET` set, retention uploads each batch to `s3://<bucket>/events/YYYY-MM-DD/`, encrypted at rest under the KMS key (SSE-KMS), before deleting the rows.
+- **Don't keep `KMS_KEY_ID` in `.env` locally:** LocalStack's free edition keeps no state, so after a restart its key is gone and secrets wrapped under it can't be decrypted (rotate them to recover).
+
 ## Containers and Kubernetes
 
 One image runs every process; each Kubernetes Deployment just runs a different command.
@@ -115,5 +129,6 @@ Smaller deviations:
 - **Ingest dedups on the `events.event_id` primary key only.** There's no Redis fast path in front of it, since the PK index check is already cheap.
 - **Subscriptions are an `event_types` list on the endpoint** (NULL = every type), not a separate `subscriptions` table: same capability, one fewer join on the hot path.
 - **Dead letters are `delivery_attempts` rows with `status = 'dead'`**, not a separate `dead_letters` table, and there's no `delivery_status` projection table: `delivery_attempts` plus the ledger answer the status API (p95 13–23ms over 1M ledger rows, `docs/load-test-results.md` §6).
-- **Ledger partitions older than the cutoff are dropped once empty**, rather than archived per partition: retention already archives each event with its ledger rows (local gzip files stand in for S3).
-- **Not built (costs money):** AWS (EKS, RDS, MSK, ElastiCache, S3), Terraform, the deploy stage of CI/CD, KMS for secrets (AES-GCM with a key from the environment today), ADR-003.
+- **Ledger partitions older than the cutoff are dropped once empty**, rather than archived per partition: retention already archives each event with its ledger rows (to S3 with `ARCHIVE_BUCKET`, else local gzip files).
+- **KMS and S3 are built and tested against LocalStack, not a real AWS account:** envelope encryption of endpoint secrets and S3 archives (see below). LocalStack's free edition doesn't offer EKS, RDS, MSK or ElastiCache.
+- **Not built (costs money):** the managed AWS services (EKS, RDS, MSK, ElastiCache), Terraform, the deploy stage of CI/CD, ADR-003.

@@ -1,7 +1,7 @@
 // npm run migrate - applies schema.sql (idempotent), creates Kafka topics, and gives
 // any endpoint without a signing secret a new one (never printed - rotate it in the dashboard).
 import fs from 'node:fs/promises';
-import { pool, encryptSecret, ensureTopics, kafka, TOPICS, EVENT_PARTITIONS } from './lib/infra.js';
+import { pool, encryptSecret, rewrapSecrets, ensureTopics, kafka, TOPICS, EVENT_PARTITIONS } from './lib/infra.js';
 import { generateSecret } from './core/signing.js';
 
 await pool.query(await fs.readFile(new URL('./schema.sql', import.meta.url), 'utf8'));
@@ -10,11 +10,14 @@ console.log('Schema applied.');
 const { rows } = await pool.query('SELECT endpoint_id, tenant_id, url FROM endpoints WHERE secret_encrypted IS NULL');
 for (const ep of rows) {
   const secret = generateSecret();
-  await pool.query('UPDATE endpoints SET secret_encrypted = $2 WHERE endpoint_id = $1', [ep.endpoint_id, encryptSecret(secret)]);
+  await pool.query('UPDATE endpoints SET secret_encrypted = $2 WHERE endpoint_id = $1', [ep.endpoint_id, await encryptSecret(secret)]);
   // Never print the secret: in a cluster this runs as a Job whose logs are collected and kept.
   // The tenant gets a usable secret via the dashboard's "Rotate secret" (shown once).
   console.log(`Generated a signing secret for ${ep.tenant_id} endpoint ${ep.endpoint_id}; use "Rotate secret" in the dashboard to obtain one.`);
 }
+
+// With KMS_KEY_ID set, move secrets still under the environment key to KMS envelope encryption.
+if (process.env.KMS_KEY_ID) console.log(`Secrets re-wrapped under KMS: ${await rewrapSecrets()} endpoint(s).`);
 
 await ensureTopics();
 console.log('Kafka topics ensured.');

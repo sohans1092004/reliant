@@ -109,7 +109,7 @@ const routes = [
     const { rows } = await pool.query(
       `INSERT INTO endpoints (tenant_id, url, secret_encrypted, event_types) VALUES ($1, $2, $3, $4)
        RETURNING endpoint_id, url, is_active, event_types, created_at`,
-      [t, body.url, encryptSecret(secret), eventTypes],
+      [t, body.url, await encryptSecret(secret), eventTypes],
     );
     return [201, { ...rows[0], secret, note: 'Store this secret now - it will not be shown again.' }];
   }],
@@ -136,7 +136,7 @@ const routes = [
     await pool.query(
       `UPDATE endpoints SET secret_previous_encrypted = secret_encrypted, secret_encrypted = $3, secret_rotated_at = NOW()
        WHERE endpoint_id = $1 AND tenant_id = $2`,
-      [id, t, encryptSecret(secret)],
+      [id, t, await encryptSecret(secret)],
     );
     return { endpoint_id: id, secret, note: 'The previous secret keeps working for 24 hours. Store this one now - it will not be shown again.' };
   }],

@@ -139,8 +139,10 @@ test('happy path: delivered once, signature verifies, state is "delivered"', asy
   const [hit] = await waitFor(() => okFor('/ok', body.event_id).length && okFor('/ok', body.event_id), 'delivery to /ok');
   assert.equal(hit.verified, true, 'receiver could not verify the HMAC signature');
 
-  const state = await dash('pipe_ok', 'GET', `/api/endpoints/${endpoints.pipe_ok}/deliveries/${body.event_id}`);
-  assert.equal(state.body.current_state, 'delivered');
+  // The ledger row lands when the consumer's whole chunk is done, a moment after the POST
+  // arrives (longer when another endpoint in the chunk is slow, e.g. a first KMS decrypt).
+  await waitFor(async () => (await dash('pipe_ok', 'GET', `/api/endpoints/${endpoints.pipe_ok}/deliveries/${body.event_id}`))
+    .body.current_state === 'delivered', 'state "delivered"', 10_000);
 
   // Producer retry with the same event_id: deduplicated, not re-delivered.
   const dup = await ingest('pipe_ok', { event_id: body.event_id });

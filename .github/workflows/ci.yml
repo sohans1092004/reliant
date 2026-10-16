@@ -43,7 +43,7 @@ jobs:
         working-directory: sdk/python
 
   integration:
-    name: Integration tests (Postgres + Redis + Redpanda)
+    name: Integration tests (Postgres + Redis + Redpanda + LocalStack KMS/S3)
     needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -57,6 +57,13 @@ jobs:
       REDIS_URL: redis://localhost:6379
       ALLOW_PRIVATE_ENDPOINTS: "true" # the tests' customer endpoints run on localhost
       KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      # LocalStack stands in for AWS: every endpoint secret in the run is KMS envelope-
+      # encrypted, and tests/aws.test.js covers KMS and the S3 archive directly.
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      KMS_KEY_ID: alias/reliant-secrets
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -71,8 +78,8 @@ jobs:
           echo "SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
           echo "INGEST_TOKEN=$(openssl rand -hex 24)" >> "$GITHUB_ENV"
 
-      - name: Start Postgres, Redis, Redpanda
-        run: docker compose up -d
+      - name: Start Postgres, Redis, Redpanda, LocalStack
+        run: docker compose --profile aws up -d --wait
 
       # migrate needs Postgres AND Kafka, so retrying it doubles as the readiness check.
       - name: Wait for services, then migrate

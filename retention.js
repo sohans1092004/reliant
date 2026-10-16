@@ -9,6 +9,9 @@
 // The consumer already sends Kafka messages whose events row is gone to the DLQ topic,
 // so deleting archived events can't stall a partition.
 //
+// Archives go to S3 when ARCHIVE_BUCKET is set (encrypted at rest under KMS_KEY_ID if that's
+// set too), otherwise to local files in ./archive.
+//
 // Also maintains the ledger's monthly partitions: creates the coming months, and drops
 // a month once it's past the cutoff AND empty (its rows went out with their events).
 import fs from 'node:fs/promises';
@@ -18,11 +21,13 @@ import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { pool } from './lib/infra.js';
 import { log } from './lib/log.js';
+import { putObject } from './lib/aws.js';
 
 const gzip = promisify(zlib.gzip);
 const BATCH = 1000;
 
-export async function runRetention({ days = 35, apply = false, archiveDir = 'archive', tenantLike = '%' } = {}) {
+export async function runRetention({ days = 35, apply = false, archiveDir = 'archive', tenantLike = '%',
+  bucket = process.env.ARCHIVE_BUCKET, kmsKeyId = process.env.KMS_KEY_ID } = {}) {
   if (days < 30) throw new Error('retention must be >= 30 days (spec: 30-day replay window)');
   const cutoff = `${days} days`;
   const eligible = `e.created_at < NOW() - $1::interval AND e.tenant_id LIKE $2
@@ -37,7 +42,7 @@ export async function runRetention({ days = 35, apply = false, archiveDir = 'arc
     return { dryRun: true, events: r.n };
   }
 
-  await fs.mkdir(archiveDir, { recursive: true });
+  if (!bucket) await fs.mkdir(archiveDir, { recursive: true });
   let total = 0;
   const files = [];
   for (;;) {
@@ -56,15 +61,21 @@ export async function runRetention({ days = 35, apply = false, archiveDir = 'arc
 
       // Archive BEFORE deleting. If the delete then fails, the next run archives the
       // batch again: duplicates in the archive, never a gap.
-      // ponytail: local gzip files stand in for S3; swap the writeFile for an S3 put.
       const lines = events.map((e) => JSON.stringify({
         event: e,
         ledger: ledger.filter((l) => l.event_id === e.event_id),
         delivery_attempts: attempts.filter((a) => a.event_id === e.event_id),
       }));
-      const file = path.join(archiveDir, `events-${new Date().toISOString().replace(/[:.]/g, '-')}-${total}.jsonl.gz`);
-      await fs.writeFile(file, await gzip(lines.join('\n') + '\n'));
-      files.push(file);
+      const now = new Date().toISOString();
+      const name = `events-${now.replace(/[:.]/g, '-')}-${total}.jsonl.gz`;
+      const body = await gzip(lines.join('\n') + '\n');
+      if (bucket) { // one prefix per day, so a lifecycle rule or a lookup can target a date
+        files.push(await putObject(bucket, `events/${now.slice(0, 10)}/${name}`, body, kmsKeyId));
+      } else {
+        const file = path.join(archiveDir, name);
+        await fs.writeFile(file, body);
+        files.push(file);
+      }
 
       await client.query('DELETE FROM delivery_ledger WHERE event_id = ANY($1::uuid[])', [ids]);
       await client.query('DELETE FROM delivery_attempts WHERE event_id = ANY($1::uuid[])', [ids]);

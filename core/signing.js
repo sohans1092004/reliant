@@ -49,8 +49,8 @@ export function activeSecrets({ secret, secretPrevious, rotatedAt }, now) {
   return inWindow ? [secret, secretPrevious] : [secret];
 }
 
-// AES-256-GCM. `key` is 32 bytes. Output: base64(iv | tag | ciphertext).
-// ponytail: local key from env stands in for KMS; swap encrypt/decrypt for KMS calls in prod.
+// AES-256-GCM. `key` is 32 bytes. Output: base64(iv | tag | ciphertext). The key is either
+// the environment key or a per-secret KMS data key (envelope encryption: lib/infra.js).
 export function encrypt(plaintext, key) {
   const iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', key, iv);

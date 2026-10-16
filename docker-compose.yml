@@ -34,6 +34,23 @@ services:
     ports:
       - "9092:9092"
 
+  # Opt-in: docker compose --profile aws up -d  ->  KMS and S3 on http://localhost:4566
+  # LocalStack's free edition stands in for AWS: envelope encryption of endpoint secrets
+  # (KMS_KEY_ID) and retention archives (ARCHIVE_BUCKET). See .env.example.
+  reliant_localstack:
+    image: localstack/localstack:4.9.2 # free edition, no account token needed
+    profiles: [aws]
+    environment:
+      SERVICES: kms,s3
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3api head-bucket --bucket reliant-archive"]
+      interval: 3s
+      retries: 40
+
   # Opt-in: docker compose --profile observability up -d  ->  http://localhost:9090
   # Scrapes the Reliant processes on the host; alert rules in observability/alerts.yml.
   reliant_prometheus:

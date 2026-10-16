@@ -76,7 +76,7 @@ async function setupTenants(n, paths) {
     await pool.query('INSERT INTO tenants (tenant_id, name, api_key_hash) VALUES ($1, $1, $2)', [t, sha256(crypto.randomUUID())]);
     for (const path of paths) {
       await pool.query('INSERT INTO endpoints (tenant_id, url, secret_encrypted) VALUES ($1, $2, $3)',
-        [t, `http://${SINK_HOST}:${sinkPort}${path}`, encryptSecret(generateSecret())]);
+        [t, `http://${SINK_HOST}:${sinkPort}${path}`, await encryptSecret(generateSecret())]);
     }
   }
   return tenants;
