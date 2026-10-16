@@ -8,12 +8,16 @@
 // RETENTION_DAYS (default 35) must stay above the 30-day replay requirement (ADR-001).
 // The consumer already sends Kafka messages whose events row is gone to the DLQ topic,
 // so deleting archived events can't stall a partition.
+//
+// Also maintains the ledger's monthly partitions: creates the coming months, and drops
+// a month once it's past the cutoff AND empty (its rows went out with their events).
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { pool } from './lib/infra.js';
+import { log } from './lib/log.js';
 
 const gzip = promisify(zlib.gzip);
 const BATCH = 1000;
@@ -23,6 +27,10 @@ export async function runRetention({ days = 35, apply = false, archiveDir = 'arc
   const cutoff = `${days} days`;
   const eligible = `e.created_at < NOW() - $1::interval AND e.tenant_id LIKE $2
     AND NOT EXISTS (SELECT 1 FROM delivery_attempts da WHERE da.event_id = e.event_id AND da.status = 'pending')`;
+
+  await pool.query('SELECT ensure_ledger_partitions()');
+  const { rows: [def] } = await pool.query('SELECT EXISTS (SELECT 1 FROM delivery_ledger_default) AS used');
+  if (def.used) log.warn('ledger rows in delivery_ledger_default: a month had no partition. Move them before creating it');
 
   if (!apply) {
     const { rows: [r] } = await pool.query(`SELECT count(*)::int AS n FROM events e WHERE ${eligible}`, [cutoff, tenantLike]);
@@ -70,7 +78,27 @@ export async function runRetention({ days = 35, apply = false, archiveDir = 'arc
       client.release();
     }
   }
-  return { dryRun: false, events: total, files };
+  return { dryRun: false, events: total, files, droppedPartitions: await dropOldPartitions(cutoff) };
+}
+
+// A whole month past the cutoff whose rows are all gone. Rows can only remain if their
+// event is still pending (kept above) - then the month stays until it isn't.
+async function dropOldPartitions(cutoff) {
+  const { rows } = await pool.query(
+    `SELECT c.relname AS name FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+     WHERE i.inhparent = 'delivery_ledger'::regclass AND c.relname ~ '^delivery_ledger_[0-9]{4}_[0-9]{2}$'
+       AND (to_date(substr(c.relname, 17), 'YYYY_MM') + INTERVAL '1 month') <= (NOW() - $1::interval) AT TIME ZONE 'UTC'
+     ORDER BY 1`,
+    [cutoff],
+  );
+  const dropped = [];
+  for (const { name } of rows) {
+    const { rows: [r] } = await pool.query(`SELECT EXISTS (SELECT 1 FROM ${name}) AS used`); // name matched the regex above
+    if (r.used) continue;
+    await pool.query(`DROP TABLE ${name}`);
+    dropped.push(name);
+  }
+  return dropped;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -79,6 +107,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const result = await runRetention({ days, apply });
   console.log(result.dryRun
     ? `Dry run: ${result.events} event(s) older than ${days} days would be archived and deleted. Re-run with --apply.`
-    : `Archived and deleted ${result.events} event(s) older than ${days} days into ${result.files.length} file(s).`);
+    : `Archived and deleted ${result.events} event(s) older than ${days} days into ${result.files.length} file(s). `
+      + `Dropped ledger partitions: ${result.droppedPartitions.join(', ') || 'none'}.`);
   await pool.end();
 }

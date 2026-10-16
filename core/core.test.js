@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { nextRetryDelay, validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './backoff.js';
 import * as cb from './circuit-breaker.js';
 import * as sig from './signing.js';
-import { validateEvent } from './event.js';
+import { validateEvent, validateEventTypes } from './event.js';
 
 test('backoff: follows the schedule, within jitter bounds, never negative', () => {
   for (let n = 1; n <= DEFAULT_SCHEDULE_MINUTES.length; n++) {
@@ -102,4 +102,12 @@ test('event validation', () => {
   assert.equal(validateEvent({ ...ok, payload: [1] }).length, 1);
   assert.equal(validateEvent({ ...ok, tenant_id: "x'; drop" }).length, 1);
   assert.equal(validateEvent(null).length, 1);
+});
+
+test('subscription event types: null = all, else 1-50 valid type names', () => {
+  assert.equal(validateEventTypes(null), null);
+  assert.equal(validateEventTypes(['order.created', 'invoice.paid']), null);
+  for (const bad of [[], 'order.created', [''], ['has space'], [42], Array(51).fill('x')]) {
+    assert.ok(validateEventTypes(bad), `accepted ${JSON.stringify(bad)}`);
+  }
 });

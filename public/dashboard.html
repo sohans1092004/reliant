@@ -41,9 +41,10 @@
   <div id="app" hidden>
     <h2>Endpoints</h2>
     <section>
-      <table><thead><tr><th>URL</th><th>Active</th><th>Circuit</th><th></th></tr></thead><tbody id="endpoints"></tbody></table>
+      <table><thead><tr><th>URL</th><th>Event types</th><th>Active</th><th>Circuit</th><th></th></tr></thead><tbody id="endpoints"></tbody></table>
       <form id="create" class="row" style="margin-top:12px">
         <input id="newUrl" class="grow" type="url" required placeholder="https://example.com/webhooks" aria-label="New endpoint URL">
+        <input id="newTypes" placeholder="event types, comma-separated (empty = all)" aria-label="Event types for the new endpoint">
         <button>Add endpoint</button>
       </form>
       <div id="secretBox" class="secret" hidden></div>
@@ -96,6 +97,8 @@ function btn(label, onClick) { const b = el('button', label); b.type = 'button';
 function tr(...cells) { const r = document.createElement('tr'); for (const c of cells) { const td = document.createElement('td'); c instanceof Node ? td.append(c) : td.textContent = c ?? ''; r.append(td); } return r; }
 const when = (t) => t ? new Date(t).toLocaleString() : '';
 const short = (id) => el('code', id.slice(0, 8), null);
+// "a, b" -> ['a', 'b']; empty -> null (subscribed to every event type)
+const parseTypes = (s) => { const t = s.split(',').map((x) => x.trim()).filter(Boolean); return t.length ? t : null; };
 
 function showSecret(secret, note) {
   const box = $('secretBox');
@@ -116,6 +119,12 @@ async function loadEndpoints() {
         say(`${r.requeued} dead letter(s) re-queued for this endpoint.`, 'ok');
         await loadDlq();
       })),
+      btn('Event types', () => run(async () => {
+        const s = prompt('Event types this endpoint receives, comma-separated. Leave empty for every type.', (ep.event_types || []).join(', '));
+        if (s === null) return;
+        await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { event_types: parseTypes(s) });
+        await loadEndpoints();
+      })),
       btn(ep.is_active ? 'Disable' : 'Enable', () => run(async () => { await api('PATCH', `/api/endpoints/${ep.endpoint_id}`, { is_active: !ep.is_active }); await loadEndpoints(); })),
       btn('Rotate secret', () => run(async () => {
         if (!confirm('Rotate this endpoint\'s signing secret? The old one keeps working for 24 hours.')) return;
@@ -123,7 +132,7 @@ async function loadEndpoints() {
         showSecret(r.secret, r.note);
       })),
     );
-    return tr(el('code', ep.url), ep.is_active ? 'yes' : 'no', el('span', ep.circuit, circuitCls), actions);
+    return tr(el('code', ep.url), ep.event_types ? ep.event_types.join(', ') : 'all', ep.is_active ? 'yes' : 'no', el('span', ep.circuit, circuitCls), actions);
   }));
 }
 
@@ -189,8 +198,8 @@ $('login').onsubmit = (e) => { e.preventDefault(); apiKey = $('key').value.trim(
 }); };
 
 $('create').onsubmit = (e) => { e.preventDefault(); run(async () => {
-  const r = await api('POST', '/api/endpoints', { url: $('newUrl').value });
-  $('newUrl').value = '';
+  const r = await api('POST', '/api/endpoints', { url: $('newUrl').value, event_types: parseTypes($('newTypes').value) });
+  $('newUrl').value = ''; $('newTypes').value = '';
   showSecret(r.secret, r.note);
   await loadEndpoints();
 }); };

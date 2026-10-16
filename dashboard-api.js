@@ -2,8 +2,9 @@
 //
 //   GET   /                                          dashboard UI
 //   GET   /api/endpoints                             list endpoints (+ circuit breaker state)
-//   POST  /api/endpoints              {url}          create; signing secret returned ONCE
-//   PATCH /api/endpoints/:id          {is_active}    enable / disable
+//   POST  /api/endpoints   {url, event_types?}       create; signing secret returned ONCE
+//   PATCH /api/endpoints/:id {is_active?, event_types?}  enable / disable, change subscription
+//                                    (event_types: list of types, or null = every type)
 //   POST  /api/endpoints/:id/rotate-secret           new secret returned ONCE; old one keeps
 //                                                    verifying for 24h (dual-secret window)
 //   GET   /api/endpoints/:id/deliveries              recent attempt history (ledger)
@@ -28,6 +29,7 @@ import { serveMetrics } from './lib/metrics.js';
 import { onShutdown } from './lib/shutdown.js';
 import { generateSecret } from './core/signing.js';
 import { validateRetrySchedule, DEFAULT_SCHEDULE_MINUTES } from './core/backoff.js';
+import { validateEventTypes } from './core/event.js';
 
 const PORT = Number(process.env.DASHBOARD_PORT || 3001);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -91,7 +93,7 @@ async function deliveryState(tenantId, eventId, endpointId) {
 const routes = [
   ['GET', /^\/api\/endpoints$/, async (t) => {
     const { rows } = await pool.query(
-      'SELECT endpoint_id, url, is_active, created_at, secret_rotated_at FROM endpoints WHERE tenant_id = $1 ORDER BY created_at',
+      'SELECT endpoint_id, url, is_active, event_types, created_at, secret_rotated_at FROM endpoints WHERE tenant_id = $1 ORDER BY created_at',
       [t],
     );
     for (const ep of rows) ep.circuit = (await getBreaker(ep.endpoint_id).catch(() => ({ state: 'unknown' }))).state;
@@ -100,21 +102,30 @@ const routes = [
 
   ['POST', /^\/api\/endpoints$/, async (t, _, body) => {
     await validateUrl(body.url);
+    const eventTypes = body.event_types ?? null;
+    const problem = validateEventTypes(eventTypes);
+    if (problem) throw badRequest(problem);
     const secret = generateSecret();
     const { rows } = await pool.query(
-      `INSERT INTO endpoints (tenant_id, url, secret_encrypted) VALUES ($1, $2, $3)
-       RETURNING endpoint_id, url, is_active, created_at`,
-      [t, body.url, encryptSecret(secret)],
+      `INSERT INTO endpoints (tenant_id, url, secret_encrypted, event_types) VALUES ($1, $2, $3, $4)
+       RETURNING endpoint_id, url, is_active, event_types, created_at`,
+      [t, body.url, encryptSecret(secret), eventTypes],
     );
     return [201, { ...rows[0], secret, note: 'Store this secret now - it will not be shown again.' }];
   }],
 
   ['PATCH', /^\/api\/endpoints\/([^/]+)$/, async (t, [id], body) => {
     await ownEndpoint(t, id);
-    if (typeof body.is_active !== 'boolean') throw badRequest('is_active must be a boolean');
+    const setActive = 'is_active' in body, setTypes = 'event_types' in body;
+    if (!setActive && !setTypes) throw badRequest('nothing to change: send is_active and/or event_types');
+    if (setActive && typeof body.is_active !== 'boolean') throw badRequest('is_active must be a boolean');
+    const problem = setTypes && validateEventTypes(body.event_types);
+    if (problem) throw badRequest(problem);
     const { rows } = await pool.query(
-      'UPDATE endpoints SET is_active = $3 WHERE endpoint_id = $1 AND tenant_id = $2 RETURNING endpoint_id, url, is_active',
-      [id, t, body.is_active],
+      `UPDATE endpoints SET is_active = CASE WHEN $3 THEN $4 ELSE is_active END,
+                            event_types = CASE WHEN $5 THEN $6::text[] ELSE event_types END
+       WHERE endpoint_id = $1 AND tenant_id = $2 RETURNING endpoint_id, url, is_active, event_types`,
+      [id, t, setActive, setActive ? body.is_active : null, setTypes, setTypes ? body.event_types : null],
     );
     return rows[0];
   }],

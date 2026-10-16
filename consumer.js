@@ -45,6 +45,22 @@ async function sendToDlq(poisoned, partition) {
   }
 }
 
+// Zombie guard (spec §9 #6), checked BEFORE every inline attempt. A consumer that was
+// frozen or cut off past the session timeout has lost its partitions to another
+// consumer; heartbeat() then throws (kafkajs only contacts the broker when 3s have
+// passed, so it's free otherwise). Checking after the attempt let a resumed zombie
+// deliver 136 events another consumer had already delivered (incident 004).
+// Process-wide: partitions are processed concurrently, and once membership is lost every
+// one of them must stop. Cleared when the consumer (re)joins the group.
+let membershipLost = null, membershipCheck = null;
+consumer.on(consumer.events.GROUP_JOIN, () => { membershipLost = null; });
+async function stillMember(heartbeat) {
+  if (membershipLost) throw membershipLost;
+  membershipCheck ??= heartbeat().catch((err) => { membershipLost = err; }).finally(() => { membershipCheck = null; });
+  await membershipCheck;
+  if (membershipLost) throw membershipLost;
+}
+
 // One chunk of a partition's messages, in Kafka order. The bookkeeping is done per
 // chunk instead of per message: ~6 round trips per chunk instead of ~6 per message.
 async function processChunk(messages, partition, heartbeat) {
@@ -77,7 +93,7 @@ async function processChunk(messages, partition, heartbeat) {
   const tenants = [...new Set(valid.map((e) => e.tenant_id))];
   const { rows: endpoints } = await pool.query(
     `SELECT ep.tenant_id, ep.endpoint_id, ep.url, ep.secret_encrypted, ep.secret_previous_encrypted, ep.secret_rotated_at,
-            t.retry_schedule_minutes
+            ep.event_types, t.retry_schedule_minutes
      FROM endpoints ep JOIN tenants t USING (tenant_id)
      WHERE ep.tenant_id = ANY($1) AND ep.is_active = TRUE`,
     [tenants],
@@ -98,6 +114,7 @@ async function processChunk(messages, partition, heartbeat) {
   //    are strictly sequential, and once something is queued, everything after it is
   //    queued behind it (per-endpoint order, ADR-008).
   const ledger = [], queue = [], outcomes = new Map(); // endpoint_id -> [{ ok, at }]
+
   await Promise.all(endpoints.map(async (endpoint) => {
     const breaker = breakers.get(endpoint.endpoint_id) ?? cb.initialState();
     // Already-known-bad endpoints get no inline attempt: let the worker handle them.
@@ -106,6 +123,7 @@ async function processChunk(messages, partition, heartbeat) {
 
     for (const event of valid) {
       if (event.tenant_id !== endpoint.tenant_id) continue;
+      if (endpoint.event_types && !endpoint.event_types.includes(event.type)) continue; // not subscribed
       // Out of time budget: hand the rest to the worker without a failed attempt, so a
       // slow-but-working endpoint can't hold the whole partition for N x timeout.
       if (blocked || Date.now() >= deadline) {
@@ -113,6 +131,7 @@ async function processChunk(messages, partition, heartbeat) {
         queue.push({ event_id: event.event_id, endpoint_id: endpoint.endpoint_id, attempt_count: 0, delay_ms: 0, error: null, http_status: null });
         continue;
       }
+      await stillMember(heartbeat);
       const started = Date.now();
       metrics.deliveryLatency.observe((started - Date.parse(event.created_at)) / 1000);
       // The attempt's span becomes part of this event's trace, not the chunk's.
@@ -123,7 +142,6 @@ async function processChunk(messages, partition, heartbeat) {
         attempt_number: 1, ...result, latencyMs: Date.now() - started });
       if (!outcomes.has(endpoint.endpoint_id)) outcomes.set(endpoint.endpoint_id, []);
       outcomes.get(endpoint.endpoint_id).push({ ok: result.ok, at: Date.now() });
-      await heartbeat();
       if (!result.ok) {
         blocked = true;
         // Timed out = maybe just slow: worker retries now with a longer timeout. Any
@@ -145,6 +163,11 @@ async function processChunk(messages, partition, heartbeat) {
     .map((id) => trace.getSpanContext(traceCtx.get(id)))
     .filter((sc) => sc && trace.isSpanContextValid(sc))
     .map((sc) => ({ context: sc }));
+  // Fence the writes too: a chunk whose last attempt was in flight across a freeze makes
+  // no further attempt (so never re-checks above), and its retry-queue rows would make a
+  // worker deliver again what the new owner already delivered (incident 004). The new
+  // owner reprocesses these messages from the last commit, so nothing is lost by skipping.
+  await stillMember(heartbeat);
   await recordAttempts(ledger, links);
   if (queue.length) {
     const col = (f) => queue.map(f);

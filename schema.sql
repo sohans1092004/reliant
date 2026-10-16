@@ -56,6 +56,8 @@ ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS secret_encrypted          TEXT;
 ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS secret_previous_encrypted TEXT;
 ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS secret_rotated_at         TIMESTAMPTZ;
 ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW();
+-- Subscriptions (spec FR2): which event types this endpoint receives. NULL = every type.
+ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS event_types               TEXT[];
 
 -- Current delivery state per (event, endpoint) - the "what happened to my webhook" projection.
 -- Only written when the inline attempt didn't succeed (or on replay); a clean inline
@@ -81,9 +83,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS delivery_attempts_pair ON delivery_attempts (e
 CREATE INDEX IF NOT EXISTS delivery_attempts_pending ON delivery_attempts (endpoint_id, created_at, id) WHERE status = 'pending';
 
 -- Append-only audit trail: one row per HTTP attempt, inline or retry. Never updated.
--- ponytail: not time-partitioned yet; add monthly RANGE partitions when it gets big.
+-- Monthly RANGE partitions on attempted_at (spec §5): retention drops a whole old month
+-- instead of deleting it row by row, and dashboard queries only touch recent months.
+
+-- One-time conversion of a table created before partitioning: move it (and the names it
+-- owns) aside; its rows are copied into the partitioned table further down.
+-- Run with consumers and workers stopped: ledger writes fail between these statements.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'delivery_ledger' AND relkind = 'r') THEN
+    ALTER TABLE delivery_ledger RENAME TO delivery_ledger_unpartitioned;
+    ALTER SEQUENCE delivery_ledger_id_seq RENAME TO delivery_ledger_unpartitioned_id_seq;
+    ALTER INDEX delivery_ledger_pkey RENAME TO delivery_ledger_unpartitioned_pkey;
+    ALTER INDEX IF EXISTS ledger_dashboard RENAME TO ledger_dashboard_unpartitioned;
+    ALTER INDEX IF EXISTS ledger_pair RENAME TO ledger_pair_unpartitioned;
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS delivery_ledger (
-  id               BIGSERIAL PRIMARY KEY,
+  id               BIGSERIAL,
   event_id         UUID NOT NULL REFERENCES events(event_id),
   endpoint_id      UUID NOT NULL REFERENCES endpoints(endpoint_id),
   tenant_id        TEXT NOT NULL,
@@ -92,10 +109,50 @@ CREATE TABLE IF NOT EXISTS delivery_ledger (
   http_status_code INT,
   latency_ms       INT,
   error_detail     TEXT,
-  attempted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+  attempted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id, attempted_at) -- a partitioned table's key must include the partition column
+) PARTITION BY RANGE (attempted_at);
 CREATE INDEX IF NOT EXISTS ledger_dashboard ON delivery_ledger (tenant_id, endpoint_id, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS ledger_pair ON delivery_ledger (event_id, endpoint_id, attempted_at DESC);
+
+-- delivery_ledger_YYYY_MM covers one calendar month (UTC).
+CREATE OR REPLACE FUNCTION create_ledger_partition(month DATE) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE start DATE := date_trunc('month', month)::date;
+BEGIN
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF delivery_ledger FOR VALUES FROM (%L) TO (%L)',
+    'delivery_ledger_' || to_char(start, 'YYYY_MM'),
+    (start::timestamp AT TIME ZONE 'UTC'), ((start + INTERVAL '1 month')::timestamp AT TIME ZONE 'UTC'));
+END $$;
+
+-- This month and the next `ahead`. Run by migrate and by every retention run (daily),
+-- so a month's partition always exists before its first write.
+CREATE OR REPLACE FUNCTION ensure_ledger_partitions(ahead INT DEFAULT 3) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 0..ahead LOOP
+    PERFORM create_ledger_partition((date_trunc('month', NOW() AT TIME ZONE 'UTC') + make_interval(months => i))::date);
+  END LOOP;
+END $$;
+
+-- Safety net: if partition maintenance stops running, writes land here instead of failing
+-- (a failed ledger write stalls consumption). Rows here block creating their month's
+-- partition later, so this should stay empty: the retention job warns when it isn't.
+CREATE TABLE IF NOT EXISTS delivery_ledger_default PARTITION OF delivery_ledger DEFAULT;
+SELECT ensure_ledger_partitions();
+
+DO $$
+DECLARE m DATE;
+BEGIN
+  IF to_regclass('delivery_ledger_unpartitioned') IS NOT NULL THEN
+    FOR m IN SELECT DISTINCT date_trunc('month', attempted_at AT TIME ZONE 'UTC')::date FROM delivery_ledger_unpartitioned LOOP
+      PERFORM create_ledger_partition(m);
+    END LOOP;
+    INSERT INTO delivery_ledger (id, event_id, endpoint_id, tenant_id, attempt_number, status, http_status_code, latency_ms, error_detail, attempted_at)
+      SELECT id, event_id, endpoint_id, tenant_id, attempt_number, status, http_status_code, latency_ms, error_detail, attempted_at
+      FROM delivery_ledger_unpartitioned;
+    PERFORM setval(pg_get_serial_sequence('delivery_ledger', 'id'), GREATEST((SELECT max(id) FROM delivery_ledger), 1));
+    DROP TABLE delivery_ledger_unpartitioned;
+  END IF;
+END $$;
 
 -- Dev seed. Dashboard API keys: dev_key_tenant_a / dev_key_tenant_b. Local only.
 INSERT INTO tenants (tenant_id, name, api_key_hash) VALUES

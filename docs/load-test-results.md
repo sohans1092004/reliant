@@ -1,6 +1,6 @@
-# Load test results (Day 4)
+# Load test results (Days 4–6)
 
-Spec §14 and v2 §5, scaled to one machine. Harness: `loadtest/run.js` (`ingest | isolation | recovery`).
+Spec §14 and v2 §5, scaled to one machine. Harness: `loadtest/run.js` (`ingest | isolation | recovery | recovery-spec | dashboard`).
 
 **Environment:** Windows 11, 20 logical cores, Node 22. Postgres 16, Redis 7 and Redpanda (1 node) all run in Docker Desktop on the same machine, with the default 10-connection `pg` pool per process. The load generator, the services and the databases share one machine, so the absolute numbers are **lower bounds**. What carries over to real hardware is where each bottleneck sits.
 
@@ -11,8 +11,9 @@ Spec §14 and v2 §5, scaled to one machine. Harness: `loadtest/run.js` (`ingest
 | Spec target | Result | Verdict |
 |---|---|---|
 | Ingest 1,000 events/s baseline | ~950/s per process; 2 processes ~1,290/s; 4 processes ~1,930/s | **Met with 2+ processes** |
-| Healthy endpoints' p95 unaffected by a broken endpoint of the same tenant | Steady state: unaffected. **First ~10s after an endpoint breaks: p95 up to 5.8s** (was ~20s before the batched consumer) | **Not met:** a startup transient, now half as long |
-| Recovery: drain at ~2,000 events/s | Batched consumer: ~800–960/s with 1 consumer, ~1,500–1,780/s peak with 3 (was ~180/s) | **Not met yet:** ~5x better, limited by consumer CPU and partition skew |
+| Healthy endpoints' p95 unaffected by a broken endpoint of the same tenant | Steady state: unaffected. **First 5s after an endpoint breaks: p95 1.7s** (§5; was 5.8s over ~10s) | **Mostly met:** a sub-5s blip, accepted in ADR-007 |
+| Recovery: 600,000-event backlog drained within 5 minutes | **139s** with 6 consumers + 2 workers, 12 partitions: ~4,300 events/s, all 600,000 in the ledger, 0 duplicates (§7) | **Met** |
+| Delivery-state query p95 < 200ms (history < 500ms) | 13–23ms (history 15–34ms) over 1M ledger rows (§6) | **Met** |
 
 ## 1. Ingest throughput
 
@@ -122,6 +123,52 @@ Ways to remove the remaining stall (an ADR-007 decision):
 2. **Queue first, attempt in the background:** write the queue row, commit the offset, attempt outside the batch. No stall at all, but every delivery costs a write again (the Day 2 trade-off).
 3. **Pipeline batches:** keep fetching while attempts are in flight, and commit only up to the lowest finished offset. No stall and no extra writes, but the most complex option.
 
+## 5. Endpoint isolation re-measured (Day 6: 1s inline timeout, 12 partitions)
+
+Same setup as §2. `lt_0` and `lt_1` still share a partition (9 of 12), so the cross-tenant case is covered.
+
+| Run | p50 | p95 | p99 |
+|---|---|---|---|
+| Baseline | 24ms | 50ms | 66ms |
+| + 1 hanging endpoint per tenant | 26ms | **594ms** (was 4,593ms) | 1,625ms |
+
+```
+baseline: 0-5s 53ms   | 5-10s 55ms | 10-15s 44ms | 15-20s 54ms | 20-25s 46ms | 25-30s 49ms
+hanging:  0-5s 1678ms | 5-10s 44ms | 10-15s 43ms | 15-20s 57ms | 20-25s 52ms | 25-30s 53ms
+```
+
+The transient is now under 5 seconds, peaking at a p95 of 1.7s. Every window after that matches the baseline. ADR-007 records the decision to accept the remaining blip rather than pipeline batches.
+
+## 6. Dashboard query latency (Day 6)
+
+`npm run loadtest -- dashboard`: one tenant, 200,000 events × 5 endpoints = **1,000,000 ledger rows over 30 days** in monthly partitions, 5% of them still in the retry queue. Measured through the real dashboard API: 1,000 random events for the state query, 300 history requests.
+
+| Query | Concurrency | p50 | p95 | p99 | Target |
+|---|---|---|---|---|---|
+| State ("what happened to my webhook") | 1 | 8ms | 13ms | 17ms | p95 < 200ms: **met** |
+| History (last 100 attempts of an endpoint) | 1 | 9ms | 15ms | 20ms | p95 < 500ms: **met** |
+| State | 8 | 14ms | 23ms | 38ms | **met** |
+| History | 8 | 24ms | 34ms | 43ms | **met** |
+
+Both queries are index lookups: `ledger_pair` for the state query and `ledger_dashboard` for history, each partitioned by month. So they stay flat as history grows, and a separate `delivery_status` projection table (spec v2 §2) isn't needed to meet the target.
+
+## 7. Recovery benchmark at the spec's size (Day 6)
+
+`npm run loadtest -- recovery-spec`: the spec's condition (v2 §1.2) is consumers offline for 10 minutes at 1,000 events/s. The **600,000-event backlog** is written straight to Postgres and Kafka exactly as ingest writes it (28s), because this measures the drain, not ingest. Then 6 consumers and 2 workers start at once. 30 tenants with one healthy endpoint each; 12 partitions.
+
+```
+t+10s 51,745 | t+20s 131,083 | t+30s 211,580 | t+40s 284,861 | t+50s 340,168 | ... | t+100s 557,726
+drained 600,000 in 139s (consumer start + group join included) = 4,326 events/s
+ledger: 600,000 delivered; duplicates at receiver: 0
+```
+
+**Met: 139s against a 300s target**, about 2.2x the required 2,000 events/s, verified against the ledger.
+
+The changes since §4's ~1,500/s: 12 partitions instead of 3 (more consumers can work), and the backlog spread evenly over them.
+
+- **Workers count as delivery capacity.** The first attempt ran consumers only. It handed 99,664 events to the retry queue: once an endpoint's 200-event chunk took longer than its 1s budget (ADR-007), the rest of the chunk was queued, and ordering queued everything after it. With no worker running, that run never finished. A repeat with 2 workers added queued nothing. The difference between the two runs wasn't investigated; contention on this shared machine is the likely cause. Either way, a real recovery runs both, so the benchmark now does.
+- **Not measured:** how many consumers are the minimum to meet the target, and behaviour with slow endpoints mixed into the backlog.
+
 ## Bugs found by load testing (all fixed)
 
 - **Ingest throughput:** 3 Postgres round trips per request, fixed as described in §1.
@@ -132,4 +179,4 @@ Ways to remove the remaining stall (an ADR-007 decision):
 
 - Delivery latency at higher rates and with slow-but-answering endpoints (spec §14 row 2)
 - Worker-pool scaling (more `delivery-worker.js` processes) and ledger write throughput under retry load (§14 rows 3 and 7)
-- Thundering herd when a long-down endpoint recovers (§14 row 6)
+- Thundering herd is covered by an integration test instead (`tests/pipeline.test.js`): 3 workers, half-open breaker, 40-event backlog; the endpoint saw at most 1 request at a time, in order

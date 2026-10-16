@@ -67,3 +67,26 @@ test('apply archives then deletes only old, finished events', async () => {
   assert.equal(archived.ledger.length, 1);
   assert.equal(archived.delivery_attempts[0].status, 'dead');
 });
+
+test('ledger partitions: coming months exist; an old empty month is dropped, one still in use is kept', async () => {
+  const months = (await pool.query(
+    `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'delivery_ledger'::regclass`,
+  )).rows.map((r) => r.relname);
+  const now = new Date();
+  const name = (d) => `delivery_ledger_${d.getUTCFullYear()}_${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  for (let i = 0; i <= 3; i++) assert.ok(months.includes(name(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + i, 1)))));
+
+  // Two months long past the cutoff: one empty, one holding a row of a still-pending event.
+  await pool.query(`SELECT create_ledger_partition('2020-01-01'), create_ledger_partition('2020-02-01')`);
+  await pool.query(`INSERT INTO delivery_ledger (event_id, endpoint_id, tenant_id, attempt_number, status, attempted_at)
+                    VALUES ($1, $2, $3, 1, 'failed', '2020-02-15')`, [ev.oldPending, endpoint, T]);
+  try {
+    const r = await runRetention({ days: 35, apply: true, archiveDir, tenantLike: T });
+    assert.ok(r.droppedPartitions.includes('delivery_ledger_2020_01'));
+    assert.ok(!r.droppedPartitions.includes('delivery_ledger_2020_02'), 'dropped a month that still had rows');
+    assert.equal((await pool.query(`SELECT to_regclass('delivery_ledger_2020_01') AS t`)).rows[0].t, null);
+  } finally {
+    await pool.query(`DELETE FROM delivery_ledger WHERE attempted_at < '2020-03-01'`);
+    await pool.query('DROP TABLE IF EXISTS delivery_ledger_2020_01, delivery_ledger_2020_02');
+  }
+});

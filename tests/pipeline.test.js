@@ -16,15 +16,16 @@ import { verify } from '../core/signing.js';
 const INGEST = 'http://localhost:3100';
 // Off the defaults (9100-9102) so the test can't collide with locally running services.
 const METRICS_PORTS = { 'ingest-api.js': 9190, 'consumer.js': 9191, 'delivery-worker.js': 9192 };
-const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom'];
+const TENANTS = ['pipe_ok', 'pipe_flaky', 'pipe_down', 'pipe_picky', 'pipe_burst', 'pipe_custom', 'pipe_herd'];
 const keys = Object.fromEntries(TENANTS.map((t) => [t, crypto.randomBytes(16).toString('hex')]));
 const secrets = {};      // path -> signing secret
 const endpoints = {};    // tenant -> endpoint_id
 const received = [];     // { path, eventId, type, verified, status }
 const stdout = {};       // file -> everything the child printed
 const behaviour = { flakyFailuresLeft: 2, downIsDown: true, burstFailuresLeft: 1, pickyRejectsBad: true };
+const herd = { inflight: 0, max: 0 }; // concurrent requests at /herd
 const children = [];
-let receiver, dashboardBase;
+let receiver, dashboardBase, env;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, what, timeoutMs = 40_000) {
@@ -84,6 +85,11 @@ before(async () => {
     if (path === '/picky' && event.payload.bad && behaviour.pickyRejectsBad) status = 422; // rejects one kind of event, accepts the rest
     if (path === '/burst' && behaviour.burstFailuresLeft > 0) { behaviour.burstFailuresLeft--; status = 503; }
     if (path === '/never') status = 500;
+    if (path === '/herd') { // a just-recovered endpoint: count how many requests overlap
+      herd.max = Math.max(herd.max, ++herd.inflight);
+      await sleep(30);
+      herd.inflight--;
+    }
     received.push({ path, eventId: event.event_id, type: event.type, verified, status });
     res.writeHead(status); res.end();
   });
@@ -91,14 +97,14 @@ before(async () => {
   await new Promise((r) => dashboard.listen(0, r));
   dashboardBase = `http://localhost:${dashboard.address().port}`;
 
-  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never']]) {
+  for (const [tenant, path] of [['pipe_ok', '/ok'], ['pipe_flaky', '/flaky'], ['pipe_down', '/down'], ['pipe_picky', '/picky'], ['pipe_burst', '/burst'], ['pipe_custom', '/never'], ['pipe_herd', '/herd']]) {
     const r = await dash(tenant, 'POST', '/api/endpoints', { url: `http://localhost:${receiver.address().port}${path}` });
     assert.equal(r.status, 201, JSON.stringify(r.body));
     secrets[path] = r.body.secret;
     endpoints[tenant] = r.body.endpoint_id;
   }
 
-  const env = { ...process.env, RETRY_FAST_MODE: 'true', RETRY_SCHEDULE_MINUTES: '1,1', WORKER_POLL_MS: '300', INGEST_PORT: '3100', ALLOW_PRIVATE_ENDPOINTS: 'true' };
+  env = { ...process.env, RETRY_FAST_MODE: 'true', RETRY_SCHEDULE_MINUTES: '1,1', WORKER_POLL_MS: '300', INGEST_PORT: '3100', ALLOW_PRIVATE_ENDPOINTS: 'true' };
   for (const [file, metricsPort] of Object.entries(METRICS_PORTS)) {
     const child = spawn(process.execPath, [file], { env: { ...env, METRICS_PORT: String(metricsPort) }, stdio: ['ignore', 'pipe', 'pipe'] });
     stdout[file] = '';
@@ -138,6 +144,26 @@ test('happy path: delivered once, signature verifies, state is "delivered"', asy
   assert.deepEqual([dup.status, dup.body.duplicate], [200, true]);
   await sleep(1500);
   assert.equal(okFor('/ok', body.event_id).length, 1);
+});
+
+test('subscriptions: an endpoint receives only the event types it subscribed to', async () => {
+  const url = `http://localhost:${receiver.address().port}/typed`;
+  assert.equal((await dash('pipe_ok', 'POST', '/api/endpoints', { url, event_types: [] })).status, 400);
+  const r = await dash('pipe_ok', 'POST', '/api/endpoints', { url, event_types: ['invoice.paid'] });
+  assert.equal(r.status, 201, JSON.stringify(r.body));
+  secrets['/typed'] = r.body.secret;
+
+  const order = (await ingest('pipe_ok', { type: 'order.created' })).body.event_id;
+  const invoice = (await ingest('pipe_ok', { type: 'invoice.paid' })).body.event_id;
+  await waitFor(() => okFor('/typed', invoice).length && okFor('/ok', order).length && okFor('/ok', invoice).length,
+    'typed endpoint gets invoice.paid; the all-types endpoint gets both');
+  await sleep(1000);
+  assert.equal(okFor('/typed', order).length, 0, 'order.created reached an endpoint not subscribed to it');
+
+  // null = back to every type; then disable it so later tests aren't affected.
+  const patched = await dash('pipe_ok', 'PATCH', `/api/endpoints/${r.body.endpoint_id}`, { event_types: null });
+  assert.equal(patched.body.event_types, null);
+  await dash('pipe_ok', 'PATCH', `/api/endpoints/${r.body.endpoint_id}`, { is_active: false });
 });
 
 test('poison-pill message is skipped without stalling the partition', async () => {
@@ -241,6 +267,33 @@ test("a tenant's own retry schedule replaces the global one", async () => {
   const { event_id } = (await ingest('pipe_custom')).body;
   const dead = await waitFor(async () => (await dash('pipe_custom', 'GET', '/api/dlq')).body.find((d) => d.event_id === event_id), 'dead letter');
   assert.deepEqual([dead.dead_reason, dead.attempt_count], ['delivery_exhausted', 2]); // inline + 1 retry
+});
+
+// Spec §9.12 / §14: an endpoint that was down for a long time comes back with a big
+// backlog. Three workers, breaker past its cooldown (half-open): the backlog must arrive
+// one request at a time, in order, never as a burst.
+test('thundering herd: a recovered endpoint with a 40-event backlog gets one request at a time, in order', async () => {
+  const ids = Array.from({ length: 40 }, () => crypto.randomUUID());
+  await pool.query(
+    `INSERT INTO events (event_id, tenant_id, type, payload, created_at)
+     SELECT id, 'pipe_herd', 'order.created', '{}', NOW() FROM unnest($1::uuid[]) AS id`, [ids]);
+  await pool.query(
+    `INSERT INTO delivery_attempts (event_id, endpoint_id, attempt_count, next_retry_at)
+     SELECT id, $2, 3, NOW() FROM unnest($1::uuid[]) WITH ORDINALITY AS t(id, n) ORDER BY n`, [ids, endpoints.pipe_herd]);
+  // Opened long ago: reads as half_open, so the first deliveries are trials.
+  await (await redis()).set(`cb:${endpoints.pipe_herd}`,
+    JSON.stringify({ state: 'open', failures: 0, successes: 0, openedAt: Date.now() - 10 * 60_000 }));
+
+  const extra = [1, 2].map((i) => spawn(process.execPath, ['delivery-worker.js'],
+    { env: { ...env, METRICS_PORT: String(9192 + i) }, stdio: 'ignore' }));
+  try {
+    await waitFor(() => ids.every((id) => okFor('/herd', id).length), 'backlog delivered', 60_000);
+  } finally {
+    for (const c of extra) c.kill();
+  }
+  assert.equal(herd.max, 1, `${herd.max} requests hit the recovering endpoint at once`);
+  assert.deepEqual(received.filter((r) => r.path === '/herd').map((r) => r.eventId), ids, 'not delivered in order');
+  assert.equal(JSON.parse(await (await redis()).get(`cb:${endpoints.pipe_herd}`)).state, 'closed');
 });
 
 test('metrics: each process exposes what the tests above did', async () => {

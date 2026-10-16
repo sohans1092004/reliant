@@ -51,8 +51,11 @@ npm test                      # core: backoff, circuit breaker, signing, validat
 npm run test:integration      # needs docker compose up and no consumer/worker running:
                               # tenant isolation + full pipeline end to end
 npm run loadtest -- ingest    # also: isolation, recovery. LT_INGEST_PROCS=4 for multi-process
+npm run loadtest -- recovery-spec  # spec benchmark: 600k backlog drained within 5 min (LT_CONSUMERS)
+npm run loadtest -- dashboard # dashboard query latency over 1M ledger rows
 npm run loadtest -- pg-outage # kill Postgres mid-traffic (docker on PATH); also redis-outage, kafka-outage
 bash loadtest/k8s-pg-outage.sh # the same Postgres drill against the k8s/local deployment
+LT_SINK_HOST=host.docker.internal npm run loadtest -- consumer-freeze  # zombie consumer (needs reliant:dev image)
 ```
 
 Results and bottleneck analysis: [`docs/load-test-results.md`](docs/load-test-results.md).
@@ -105,4 +108,7 @@ Smaller deviations:
 
 - **A clean inline success writes only a ledger row, not a `delivery_attempts` row.** The status API falls back to the ledger.
 - **Ingest dedups on the `events.event_id` primary key only.** There's no Redis fast path in front of it, since the PK index check is already cheap.
-- **Not built (needs AWS / real infra):** Kubernetes, Terraform, CI/CD, OpenTelemetry/metrics, ledger time-partitioning, per-tenant retry policies.
+- **Subscriptions are an `event_types` list on the endpoint** (NULL = every type), not a separate `subscriptions` table: same capability, one fewer join on the hot path.
+- **Dead letters are `delivery_attempts` rows with `status = 'dead'`**, not a separate `dead_letters` table, and there's no `delivery_status` projection table: `delivery_attempts` plus the ledger answer the status API (p95 13–23ms over 1M ledger rows, `docs/load-test-results.md` §6).
+- **Ledger partitions older than the cutoff are dropped once empty**, rather than archived per partition: retention already archives each event with its ledger rows (local gzip files stand in for S3).
+- **Not built (costs money):** AWS (EKS, RDS, MSK, ElastiCache, S3), Terraform, the deploy stage of CI/CD, KMS for secrets (AES-GCM with a key from the environment today), ADR-003.
